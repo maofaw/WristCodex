@@ -1,0 +1,23 @@
+# Credentials and machine configuration
+.env
+*.env
+!.env.example
+local.properties
+*.keystore
+*.jks
+# Build output
+.gradle/
+**/build/
+manual-build/
+*.apk
+*.idsig
+# Task data
+workspace/
+WatchRemote-Tasks/
+**/ai-results/
+**/ai-last-task.json
+**/ai-last-task.tmp
+*.log
+__pycache__/
+*.pyc
+.idea/
