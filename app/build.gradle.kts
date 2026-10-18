@@ -19,8 +19,6 @@ android {
     release {
       isMinifyEnabled = false
       isShrinkResources = false
-      proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      // debug-signed on purpose, personal sideload only
       // Release APKs must be signed with your own private signing key.
     }
   }

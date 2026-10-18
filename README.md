@@ -39,7 +39,7 @@ OPPO Watch 4 Pro（OWW221），ColorOS Watch V7.1 / Android 11，32 位 ARM。�
 ## 开发
 
 - JDK 17+、Android SDK 35、Gradle Wrapper：`./gradlew assembleDebug`（Windows 使用 gradlew.bat）。
-- Android 8.0+；CI 生成测试 APK。正式签名密钥由维护者私下管理，不提交仓库。
+- Android 8.0+；CI 生成未签名 Release APK，维护者签名后放入 Releases。正式签名密钥由维护者私下管理，不提交仓库。
 - Python 服务仅依赖标准库。测试：在 server/ 目录设置 WATCHREMOTE_TOKEN 为测试用随机值，执行 `python -m unittest test_bridge -v`。
 - 可用 WATCHREMOTE_BIND、WATCHREMOTE_PORT、WATCHREMOTE_WORKSPACE、WATCHREMOTE_TOKEN 环境变量覆盖部署配置。
 
