@@ -81,49 +81,7 @@ public class MainActivity extends Activity {
     if(get("base").isEmpty()||get("token").isEmpty())throw new IllegalStateException("请先配置电脑连接");
     return get("base")+path;
   }
-  void aiPage() {
-    atHome=false; page("Codex 任务");
-    EditText prompt=field("输入电脑要执行的任务",get("aiDraft"),false,true);
-    prompt.setMinLines(2);
-    prompt.setHint("例如：帮我整理一份待办清单");
-    prompt.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_MULTI_LINE|InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
-    prompt.addTextChangedListener(new TextWatcher(){
-      public void beforeTextChanged(CharSequence s,int start,int count,int after){}
-      public void onTextChanged(CharSequence s,int start,int before,int count){prefs.edit().putString("aiDraft",s.toString()).apply();}
-      public void afterTextChanged(Editable e){}
-    });
-    button("发送任务",()->{
-      String value=prompt.getText().toString().trim();
-      if(value.isEmpty()||value.length()>4000){status.setText("请输入 1–4000 字符的任务");return;}
-      String id=get("aiRequestId");
-      if(!value.equals(get("aiPendingPrompt"))||id.isEmpty())id=java.util.UUID.randomUUID().toString();
-      prefs.edit().putString("aiDraft",value).putString("aiPendingPrompt",value).putString("aiRequestId",id).apply();
-      final String requestId=id;
-      task(()->{
-        JSONObject payload=new JSONObject();payload.put("prompt",value);payload.put("request_id",requestId);
-        return request(endpoint("/ai/task"),"POST",payload.toString(),get("token"));
-      },message->{
-        if(message.startsWith("HTTP 202\n")) {
-          if(prompt.getText().toString().trim().equals(value))prompt.setText("");
-          prefs.edit().remove("aiRequestId").remove("aiPendingPrompt").apply();
-          prompt.clearFocus();
-          ((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(prompt.getWindowToken(),0);
-          status.setText("任务已接收\n点击刷新查看执行状态与结果。");
-        }
-      });
-    });
-    button("刷新状态 / 结果",()->task(()->request(endpoint("/ai/status")+"?t="+
-      URLEncoder.encode(get("token"),"UTF-8"),"GET","","")));
-    button("停止当前任务",()->confirm("停止当前 Codex 任务？已完成的修改不会撤销。",
-      ()->task(()->request(endpoint("/ai/stop"),"POST","{}",get("token")))));
-    text("任务状态与结果",12);
-    status=text("还没有查询结果",15);
-    status.setPadding(dp(12),dp(10),dp(12),dp(10));
-    status.setBackground(surface(Color.rgb(17,24,34),14));
-    status.setTextIsSelectable(true);
-    button("返回",this::home);
-    text("电脑需保持开机。文件写入专用任务目录。\n当前每次发送为独立任务，不接管桌面聊天。",12);
-  }
+  void aiPage() { startActivity(new android.content.Intent(this,AssistantActivity.class)); }
   EditText field(String label,String value,boolean secret,boolean multiline) {
     text(label,14); EditText e=new EditText(this); e.setTextSize(14); e.setText(value);
     e.setTextColor(Color.WHITE);e.setHintTextColor(Color.rgb(124,139,158));
@@ -212,8 +170,8 @@ public class MainActivity extends Activity {
       }
       int code=c.getResponseCode();InputStream in=code<400?c.getInputStream():c.getErrorStream();String response="";
       if(in!=null)try(Reader r=new InputStreamReader(in,StandardCharsets.UTF_8)){
-        char[] buffer=new char[2000];StringBuilder b=new StringBuilder();int n;
-        while(b.length()<2000&&(n=r.read(buffer,0,Math.min(buffer.length,2000-b.length())))>0)b.append(buffer,0,n);
+        char[] buffer=new char[65536];StringBuilder b=new StringBuilder();int n;
+        while(b.length()<65536&&(n=r.read(buffer,0,Math.min(buffer.length,65536-b.length())))>0)b.append(buffer,0,n);
         response=b.toString();
       }return "HTTP "+code+"\n"+response;
     }finally{c.disconnect();}

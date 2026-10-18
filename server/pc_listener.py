@@ -14,6 +14,8 @@ import json
 import os
 import hmac
 import ai_bridge
+from codex_session import assistant
+import voice
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -41,6 +43,13 @@ def session_locked():
   return "LogonUI.exe" in out.stdout
 
 class Handler(BaseHTTPRequestHandler):
+  def reply_json(self, code, value):
+    body=json.dumps(value,ensure_ascii=False).encode('utf-8')
+    self.send_response(code)
+    self.send_header('Content-Type','application/json; charset=utf-8')
+    self.send_header('Content-Length',str(len(body)))
+    self.end_headers()
+    self.wfile.write(body)
   def reply(self, code, text):
     body = text.encode()
     self.send_response(code)
@@ -65,6 +74,13 @@ class Handler(BaseHTTPRequestHandler):
       self.reply(200, "awake, locked" if session_locked() else "awake, unlocked")
     elif url.path == "/ai/status":
       self.reply(200, ai_bridge.display(ai_bridge.snapshot()))
+    elif url.path == '/assistant/state':
+      self.reply_json(200,assistant.snapshot())
+    elif url.path == '/assistant/events':
+      try:
+        after=int(parse_qs(url.query).get('after',['-1'])[0])
+        self.reply_json(200,assistant.events(after))
+      except ValueError:self.reply(400,'invalid revision')
     else:
       self.reply(404, "unknown")
 
@@ -75,6 +91,12 @@ class Handler(BaseHTTPRequestHandler):
       return
     try:
       length = int(self.headers.get('Content-Length', '0'))
+      if url.path == '/assistant/voice':
+        if not 1000 <= length <= 1100000:
+          self.reply(413,'录音长度无效');return
+        self.connection.settimeout(30)
+        self.reply_json(200,{'text':voice.transcribe(self.rfile.read(length))})
+        return
       if length < 0 or length > 24000:
         self.reply(413, 'request too large'); return
       self.connection.settimeout(10)
@@ -86,6 +108,12 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(202, ai_bridge.display(job))
       elif url.path == '/ai/stop':
         self.reply(200, ai_bridge.display(ai_bridge.stop()))
+      elif url.path == '/assistant/send':
+        self.reply_json(202,assistant.send(payload.get('prompt'),payload.get('request_id'),payload.get('new',False)))
+      elif url.path == '/assistant/answer':
+        self.reply_json(200,assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers')))
+      elif url.path == '/assistant/stop':
+        self.reply_json(200,assistant.stop())
       else:
         self.reply(404, 'unknown')
     except (ValueError, UnicodeError) as exc:

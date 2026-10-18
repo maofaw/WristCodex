@@ -21,3 +21,8 @@ WatchRemote-Tasks/
 __pycache__/
 *.pyc
 .idea/
+.venv/
+**/models/
+**/assistant-state.json
+**/assistant-state.tmp
+**/voice-*.wav
