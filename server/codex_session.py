@@ -8,6 +8,7 @@ import time
 import uuid
 import os
 import shutil
+import hashlib
 from ai_bridge import child_environment, WORKSPACE
 
 class Assistant:
@@ -16,6 +17,7 @@ class Assistant:
         self.cv = threading.Condition(threading.RLock())
         self.write_lock = threading.Lock()
         self.start_lock = threading.Lock()
+        self.steer_lock = threading.Lock()
         self.proc = None
         self.waiters = {}
         self.counter = 0
@@ -24,7 +26,7 @@ class Assistant:
         self.file_changes = {}
         self.timer = None
         self.state = dict(revision=0, state='idle', thread_id='', turn_id='', reply='',
-                          message='准备接收任务', request_id='', pending=[])
+                          message='准备接收任务', request_id='', pending=[], task='', supplements={})
         if self.file.exists():
             try:
                 self.state.update(json.loads(self.file.read_text(encoding='utf-8')))
@@ -35,9 +37,16 @@ class Assistant:
                 pass
         self.loaded = False
 
-    def snapshot(self):
+    def snapshot(self, compact=False):
         with self.cv:
-            return json.loads(json.dumps(self.state))
+            value=json.loads(json.dumps(self.state))
+            value.pop('supplements',None)
+            reply=value.get('reply','').strip()
+            value['summary']=reply[:180] if value['state'] in ('completed','failed','interrupted') else ''
+            value['needs_attention']=value['state']=='failed' or bool(value['pending']) or (
+                value['state']=='interrupted' and value['message']=='电脑服务已重启，可继续对话')
+            if compact:value.pop('reply',None)
+            return value
 
     def changed(self, **values):
         with self.cv:
@@ -50,10 +59,10 @@ class Assistant:
             tmp.replace(self.file)
             self.cv.notify_all()
 
-    def events(self, after):
+    def events(self, after, compact=False):
         with self.cv:
             self.cv.wait_for(lambda: self.state['revision'] > after, timeout=20)
-            return self.snapshot()
+            return self.snapshot(compact)
 
     def write(self, obj):
         with self.write_lock:
@@ -94,7 +103,7 @@ class Assistant:
                 env=child_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             self.loaded = False
             threading.Thread(target=self.read,args=(self.proc,),daemon=True).start()
-            self.call('initialize',dict(clientInfo=dict(name='wristcodex',title='WristCodex',version='0.2.0'),
+            self.call('initialize',dict(clientInfo=dict(name='wristcodex',title='WristCodex',version='0.3.0'),
                                       capabilities=dict(experimentalApi=True)))
             self.write(dict(method='initialized',params={}))
 
@@ -129,8 +138,15 @@ class Assistant:
             self.write(dict(id=event['id'],error=dict(code=-32602,message='Unexpected thread')));return
         token=str(uuid.uuid4())
         if method in ('item/commandExecution/requestApproval','item/fileChange/requestApproval'):
-            view=dict(id=token,kind='approval',title='需要你的确认',
-                      detail=(params.get('reason','')+'\n'+(params.get('command') or params.get('grantRoot') or '文件修改'))[:3000])
+            detail=((params.get('reason') or '')+'\n'+(params.get('command') or params.get('grantRoot') or '文件修改')).strip()
+            if len(detail)>10000:
+                self.write(dict(id=event['id'],result=dict(decision='decline')))
+                self.changed(message='操作详情过长，已拒绝；请在电脑处理')
+                return
+            view=dict(id=token,kind='approval',title='需要你的确认',detail=detail)
+            reason=(params.get('reason') or '').strip()
+            view['summary']=(reason.splitlines()[0][:120] if reason else
+                ('电脑请求修改文件，请查看详情后决定' if method=='item/fileChange/requestApproval' else '电脑请求执行命令，请查看详情后决定'))
             if method == 'item/fileChange/requestApproval':
                 changes=self.file_changes.get(params.get('itemId'),[])
                 detail=json.dumps(changes,ensure_ascii=False)
@@ -141,7 +157,9 @@ class Assistant:
                     self.changed(message='文件修改缺少可审阅内容，已拒绝；请在电脑检查')
                     return
         elif method == 'item/tool/requestUserInput':
-            view=dict(id=token,kind='questions',title='需要你决定',questions=params.get('questions',[]))
+            questions=params.get('questions',[])
+            view=dict(id=token,kind='questions',title='需要你决定',questions=questions,
+                      summary=(questions[0].get('question','需要你选择下一步')[:120] if questions else '需要你选择下一步'))
         else:
             # Unsupported approval types are rejected, never automatically granted.
             if method=='item/permissions/requestApproval':
@@ -173,16 +191,21 @@ class Assistant:
         method=event.get('method');p=event.get('params',{})
         if p.get('threadId') and p['threadId']!=self.state['thread_id']:return
         with self.cv:
-            if method=='item/started' and p.get('item',{}).get('type')=='fileChange':
-                self.file_changes[p['item']['id']]=p['item'].get('changes',[])
+            if method=='item/started':
+                item=p.get('item',{});kind=item.get('type')
+                if kind=='fileChange':self.file_changes[item['id']]=item.get('changes',[])
+                stages={'commandExecution':'正在执行电脑操作','fileChange':'正在修改文件',
+                        'webSearch':'正在查询资料','mcpToolCall':'正在调用工具',
+                        'agentMessage':'正在整理回复','reasoning':'正在思考'}
+                stage=stages.get(kind)
+                if stage and not self.pending and self.state['message']!=stage:self.changed(message=stage)
             elif method=='turn/started':
                 self.changed(turn_id=p['turn']['id'],state='running',message='Codex 正在处理')
             elif method=='item/agentMessage/delta':
                 self.state['reply']=(self.state['reply']+p.get('delta',''))[-20000:]
-                if time.monotonic()-self.last_delta>2:
-                    self.last_delta=time.monotonic();self.changed()
+                # Text streams stay on the PC; the watch only needs phase changes.
             elif method=='item/completed' and p.get('item',{}).get('type')=='agentMessage':
-                self.changed(reply=p['item'].get('text',self.state['reply'])[-20000:])
+                self.state['reply']=p['item'].get('text',self.state['reply'])[-20000:]
             elif method=='serverRequest/resolved':
                 for key,value in list(self.pending.items()):
                     if value['rpc_id']==p.get('requestId'):self.pending.pop(key,None)
@@ -203,9 +226,40 @@ class Assistant:
             if request_id==self.state['request_id']:return self.snapshot()
             if self.state['state'] in ('starting','running','waiting'):raise RuntimeError('当前任务未结束，请先回答或停止')
             if new:self.state['thread_id']='';self.loaded=False
-            self.changed(state='starting',message='正在连接 Codex',request_id=request_id,reply='')
+            self.file_changes.clear()
+            self.changed(state='starting',message='正在连接 Codex',request_id=request_id,reply='',turn_id='',task=prompt.strip()[:300],supplements={})
         threading.Thread(target=self.start_turn,args=(prompt,),daemon=True).start()
         return self.snapshot()
+
+    def steer(self,prompt,request_id,thread_id,turn_id):
+        if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>4000:raise ValueError('请输入 1–4000 字符')
+        if not isinstance(request_id,str) or not request_id or len(request_id)>100:raise ValueError('请求编号无效')
+        fingerprint=hashlib.sha256(json.dumps([prompt,thread_id,turn_id],ensure_ascii=False).encode()).hexdigest()
+        with self.steer_lock:
+            with self.cv:
+                receipts=self.state.setdefault('supplements',{})
+                previous=receipts.get(request_id)
+                if previous:
+                    if previous['fingerprint']!=fingerprint:raise ValueError('补充编号已被其他内容使用')
+                    if previous['status']=='accepted':return dict(self.snapshot(),supplement_accepted=True)
+                    raise RuntimeError('补充是否送达尚未确认，请先查看当前任务，不要重复提交')
+                if self.pending:raise RuntimeError('请先处理确认选项，再补充任务')
+                if self.state['state']!='running' or not turn_id or thread_id!=self.state['thread_id'] or turn_id!=self.state['turn_id']:
+                    raise RuntimeError('当前任务已变化，请刷新；补充未发送')
+                if len(receipts)>=32:raise RuntimeError('本次任务已达到 32 次补充上限，请等待任务结束')
+                receipts[request_id]=dict(fingerprint=fingerprint,status='sending')
+                self.changed()
+            try:
+                result=self.call('turn/steer',dict(threadId=thread_id,expectedTurnId=turn_id,
+                    input=[dict(type='text',text=prompt)]),timeout=15)
+                if result.get('turnId')!=turn_id:raise RuntimeError('返回的任务编号不匹配')
+            except Exception as exc:
+                with self.cv:
+                    receipts[request_id]['status']='unknown';self.changed()
+                raise RuntimeError('无法确认补充是否送达，请先查看当前任务，不要重复提交') from exc
+            with self.cv:
+                receipts[request_id]['status']='accepted';self.changed()
+                return dict(self.snapshot(),supplement_accepted=True)
 
     def start_turn(self,prompt):
         try:

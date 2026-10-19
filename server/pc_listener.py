@@ -75,11 +75,11 @@ class Handler(BaseHTTPRequestHandler):
     elif url.path == "/ai/status":
       self.reply(200, ai_bridge.display(ai_bridge.snapshot()))
     elif url.path == '/assistant/state':
-      self.reply_json(200,assistant.snapshot())
+      self.reply_json(200,assistant.snapshot(parse_qs(url.query).get('compact',['0'])[0]=='1'))
     elif url.path == '/assistant/events':
       try:
         after=int(parse_qs(url.query).get('after',['-1'])[0])
-        self.reply_json(200,assistant.events(after))
+        self.reply_json(200,assistant.events(after,parse_qs(url.query).get('compact',['0'])[0]=='1'))
       except ValueError:self.reply(400,'invalid revision')
     else:
       self.reply(404, "unknown")
@@ -112,6 +112,8 @@ class Handler(BaseHTTPRequestHandler):
         self.reply_json(202,assistant.send(payload.get('prompt'),payload.get('request_id'),payload.get('new',False)))
       elif url.path == '/assistant/answer':
         self.reply_json(200,assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers')))
+      elif url.path == '/assistant/steer':
+        self.reply_json(200,assistant.steer(payload.get('prompt'),payload.get('request_id'),payload.get('thread_id'),payload.get('turn_id')))
       elif url.path == '/assistant/stop':
         self.reply_json(200,assistant.stop())
       else:

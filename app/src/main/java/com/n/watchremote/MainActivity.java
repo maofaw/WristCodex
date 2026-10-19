@@ -31,7 +31,11 @@ public class MainActivity extends Activity {
     GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(radius));return d;
   }
   @Override public void onCreate(Bundle state) {
-    super.onCreate(state); prefs = getSharedPreferences("remote", MODE_PRIVATE); home();
+    super.onCreate(state); prefs = getSharedPreferences("remote", MODE_PRIVATE); initialPage();
+  }
+  void initialPage(){
+    if(getIntent().getBooleanExtra("controls",false))home();
+    else {aiPage();finish();}
   }
   String get(String key) { return prefs.getString(key, ""); }
   void page(String title) {
@@ -81,7 +85,11 @@ public class MainActivity extends Activity {
     if(get("base").isEmpty()||get("token").isEmpty())throw new IllegalStateException("请先配置电脑连接");
     return get("base")+path;
   }
-  void aiPage() { startActivity(new android.content.Intent(this,AssistantActivity.class)); }
+  void aiPage() {
+    startActivity(new android.content.Intent(this,AssistantActivity.class)
+      .addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP|android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP));
+    overridePendingTransition(0,0);
+  }
   EditText field(String label,String value,boolean secret,boolean multiline) {
     text(label,14); EditText e=new EditText(this); e.setTextSize(14); e.setText(value);
     e.setTextColor(Color.WHITE);e.setHintTextColor(Color.rgb(124,139,158));
