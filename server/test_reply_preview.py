@@ -156,6 +156,67 @@ class ReplyPreviewTests(unittest.TestCase):
             self.assertIsNone(p.snapshot(False)['reply_preview'])
 
 
+class RetryStageTests(unittest.TestCase):
+    @staticmethod
+    def retry():
+        return dict(type='error', message='Reconnecting secret endpoint', willRetry=True,
+            errorInfo=dict(responseStreamDisconnected=dict(httpStatusCode=None)),
+            additionalDetails='private token request timed out')
+
+    def assert_retry(self, p):
+        value = p.snapshot()
+        self.assertEqual(value['message'], '模型连接重试中')
+        self.assertEqual(value['state'], 'running')
+        self.assertFalse(value['needs_attention'])
+        self.assertEqual(value['pending_count'], 0)
+        self.assertIsNone(value['reply_preview'])
+        self.assertNotIn('secret', str(value))
+        self.assertNotIn('private token', str(value))
+
+    def test_snapshot_retry_stage_keeps_only_type_and_boolean(self):
+        raw = state()
+        raw['turnHistory']['history']['entitiesByKey']['latest']['items'] = [self.retry()]
+        p = Projection('owner')
+        p.accept(dict(type='snapshot', revision=1, conversationState=raw))
+        self.assert_retry(p)
+        self.assertEqual(p.message_items, [dict(type='error', willRetry=True)])
+
+    def test_patch_retry_clears_on_resumed_reasoning_and_agent_output(self):
+        p = projection()
+        change(p, dict(op='add', path=PREFIX + ['items', 0], value=dict(type='reasoning', id='reasoning')))
+        change(p, dict(op='add', path=PREFIX + ['items', 1], value=self.retry()))
+        self.assert_retry(p)
+        # Native output may resume by patching an existing earlier reasoning item.
+        change(p, dict(op='add', path=PREFIX + ['items', 0, 'summary'], value=['private chain']))
+        self.assertEqual(p.snapshot()['message'], '正在思考')
+        self.assertNotIn('private chain', str(p.message_items))
+        # Unrelated metadata must not replay the older retry item as current work.
+        change(p, dict(op='replace', path=['title'], value='标题'))
+        self.assertEqual(p.snapshot()['message'], '正在思考')
+        change(p, dict(op='add', path=PREFIX + ['items', 2], value=self.retry()))
+        self.assert_retry(p)
+        change(p, dict(op='add', path=PREFIX + ['items', 3], value=message('received')))
+        self.assertEqual(p.snapshot()['message'], '正在整理回复')
+        self.assertEqual(p.snapshot()['reply_preview']['text'], 'received')
+
+    def test_retry_boolean_patch_and_new_turn_clear_stage_without_alert(self):
+        p = projection()
+        item = self.retry()
+        item['willRetry'] = False
+        change(p, dict(op='add', path=PREFIX + ['items', 0], value=item))
+        self.assertNotEqual(p.snapshot()['message'], '模型连接重试中')
+        change(p, dict(op='replace', path=PREFIX + ['items', 0, 'willRetry'], value=True))
+        self.assert_retry(p)
+        change(p, dict(op='replace', path=PREFIX + ['items', 0, 'willRetry'], value=False))
+        self.assertEqual(p.snapshot()['message'], '电脑正在处理')
+        change(p, dict(op='replace', path=PREFIX + ['items', 0, 'willRetry'], value=True))
+        self.assert_retry(p)
+        change(p, dict(op='add', path=PREFIX[:-1] + ['second'], value=dict(
+            turnId='turn2', turnStartedAtMs=200, status='inProgress', params={}, items=[])))
+        self.assertEqual(p.snapshot()['message'], '电脑正在处理')
+        self.assertFalse(p.snapshot()['needs_attention'])
+
+
 class StreamingTests(unittest.TestCase):
     setUp = fixtures.SharedTests.setUp
     tearDown = fixtures.SharedTests.tearDown

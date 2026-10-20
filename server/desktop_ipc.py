@@ -153,6 +153,9 @@ class Projection:
         # and reasoning text never enter the watch projection.
         if not isinstance(item, dict):
             return {}
+        if item.get('type') == 'error':
+            # Error messages/details may contain private endpoints and tokens.
+            return dict(type='error', willRetry=item.get('willRetry') is True)
         value = {k: item.get(k) for k in ('id', 'type', 'phase')}
         if item.get('type') == 'agentMessage' and item.get('phase') in (None, 'commentary', 'final_answer'):
             text = str(item.get('text') or '')
@@ -164,7 +167,7 @@ class Projection:
                 value['changes'] = changes
         return value
 
-    def remember_item(self, item):
+    def remember_item(self, item, update_stage=True):
         if not isinstance(item, dict):
             return
         kind = item.get('type')
@@ -178,8 +181,11 @@ class Projection:
         stages = {'reasoning': '正在思考', 'commandExecution': '正在执行电脑操作',
             'fileChange': '正在修改文件', 'webSearch': '正在查询资料',
             'mcpToolCall': '正在调用工具', 'agentMessage': '正在整理回复'}
-        if kind in stages:
-            self.stage = stages[kind]
+        if update_stage:
+            if kind == 'error':
+                self.stage = '模型连接重试中' if item.get('willRetry') is True else '电脑正在处理'
+            elif kind in stages:
+                self.stage = stages[kind]
 
     def clear_body(self):
         self.message_items = []
@@ -198,13 +204,18 @@ class Projection:
             if not isinstance(items, list) or len(items) > 2048:
                 raise ValueError('当前回合消息结构不受支持')
             self.message_items = [self.project_item(i) for i in items]
+            self.stage = '电脑正在处理'
+            for item in self.message_items:
+                self.remember_item(item)
 
-    def refresh_body(self):
+    def refresh_body(self, update_stage=True):
+        if update_stage:
+            self.stage = '电脑正在处理'
         self.reply = ''
         self.items.clear()
         body = None
         for index, item in enumerate(self.message_items):
-            self.remember_item(item)
+            self.remember_item(item, update_stage)
             if item.get('type') == 'agentMessage':
                 body = (index, item)
                 if item.get('phase') != 'commentary':
@@ -265,6 +276,7 @@ class Projection:
                 if not isinstance(values, list) or len(values) > 2048:
                     raise ValueError('当前回合消息结构不受支持')
                 self.message_items = [self.project_item(i) for i in values]
+                self.refresh_body()
             elif len(tail) == 1:
                 value = dict(patch, path=tail)
                 if patch['op'] != 'remove':
@@ -272,16 +284,24 @@ class Projection:
                 self.message_items = patch_value(self.message_items, value)
                 if len(self.message_items) > 2048:
                     raise ValueError('当前回合消息过多')
+                if patch['op'] == 'remove':
+                    self.refresh_body()
+                else:
+                    self.remember_item(self.message_items[tail[0]])
             else:
                 index, field = tail[:2]
-                if field in ('id', 'type', 'phase', 'text', 'changes'):
-                    item = self.message_items[index]
+                item = self.message_items[index]
+                if field in ('id', 'type', 'phase', 'text', 'changes', 'willRetry'):
                     if field == 'text' and item.get('type') != 'agentMessage':
+                        self.remember_item(item)
                         return
                     if field == 'text':
                         item.pop('_text_digest', None)
                     item = patch_value(item, dict(patch, path=tail[1:]))
                     self.message_items[index] = self.project_item(item)
+                # A resumed native reasoning item can precede an older retry in
+                # array order. Use event order for stage, without keeping its text.
+                self.remember_item(self.message_items[index])
 
     def accept(self, change):
         if change.get('type') == 'snapshot':
@@ -326,7 +346,7 @@ class Projection:
                     self.load_turns([(str(i), t) for i, t in enumerate(patch.get('value') or [])])
                 else:
                     self.patch_turn(str(path[1]), path[2:], patch)
-        self.refresh_body()
+        self.refresh_body(update_stage=False)
         self.revision = change['revision']
 
     def latest_turn(self):
