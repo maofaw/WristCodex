@@ -1,5 +1,7 @@
 """Watch facade for the running desktop's native conversation owner."""
+from collections import OrderedDict
 import hashlib
+import logging
 import json
 import os
 from pathlib import Path
@@ -8,9 +10,12 @@ import time
 from urllib.parse import quote
 
 from conversations import Conversations
-from desktop_ipc import DesktopIPC, DesktopUnavailable, DeliveryUnknown
+from desktop_ipc import DesktopIPC, DesktopUnavailable, DeliveryUnknown, native_text
 from record_manager import RecordManager
 from ai_bridge import WORKSPACE
+
+
+LOG = logging.getLogger(__name__)
 
 
 class SharedConversations(Conversations):
@@ -46,6 +51,7 @@ class SharedAssistant:
         self.cv = threading.Condition(threading.RLock())
         self.operation_lock = threading.Lock()
         self.preference_lock = threading.Lock()
+        self.publish_lock = threading.RLock()
         self.changed_event = threading.Event()
         self.running = False
         try:
@@ -60,6 +66,10 @@ class SharedAssistant:
         self.record_factory = record_factory or RecordManager
         self.conversations = SharedConversations(self)
         self.last_signature = ''
+        self.published_previews = {}
+        self.preview_published_at = {}
+        self.next_preview_at = None
+        self.request_timings = OrderedDict()
 
     def persist(self):
         with self.preference_lock:
@@ -83,6 +93,11 @@ class SharedAssistant:
         if self.running:
             return
         self.running = True
+        # The listener has no global logging setup. Enable only this privacy-safe
+        # timing stream when the live shared service starts.
+        if not LOG.handlers and not logging.getLogger().handlers:
+            LOG.addHandler(logging.StreamHandler())
+        LOG.setLevel(logging.INFO)
         self.desktop.start()
         threading.Thread(target=self.publish_loop, name='desktop-watch-state', daemon=True).start()
         threading.Thread(target=self.discover_loop, name='desktop-owner-catalog', daemon=True).start()
@@ -98,23 +113,74 @@ class SharedAssistant:
 
     def publish_loop(self):
         while self.running:
-            self.changed_event.wait(1)
+            with self.cv:
+                due = self.next_preview_at
+            timeout = max(0, due - time.monotonic()) if due is not None else 1
+            self.changed_event.wait(timeout)
             self.changed_event.clear()
-            time.sleep(.06)  # Merge a batch of simultaneous desktop changes.
             self.publish()
 
+    @staticmethod
+    def preview_identity(value):
+        return tuple(value.get(k) for k in ('thread_id', 'turn_id', 'item_id')) if value else None
+
     def publish(self, force=False):
+        with self.publish_lock:
+            self._publish(force)
+
+    def _publish(self, force=False):
         with self.desktop.lock:
             states = [s.snapshot(self.desktop.connected) for s in self.desktop.sessions.values() if s.data]
-        # Text is included only once a turn ends; no token-level watch redraws.
-        signature = json.dumps([self.desktop.connected, self.desktop.error,
-            self.desktop_attention_enabled, self.preferred, states], sort_keys=True, ensure_ascii=False)
+        now = time.monotonic()
         with self.cv:
+            self.observe_timings(states, now)
+            self.next_preview_at = None
+            present = {s['thread_id'] for s in states}
+            for ident in set(self.published_previews) - present:
+                self.published_previews.pop(ident, None)
+                self.preview_published_at.pop(ident, None)
+            for state in states:
+                ident = state['thread_id']
+                candidate = state['reply_preview']
+                previous = self.published_previews.get(ident)
+                if candidate != previous:
+                    due = self.preview_published_at.get(ident, 0) + 1
+                    immediate = (candidate is None or previous is None
+                        or self.preview_identity(candidate) != self.preview_identity(previous)
+                        or candidate.get('complete')
+                        or candidate.get('complete') != previous.get('complete'))
+                    if immediate or now >= due:
+                        self.published_previews[ident] = candidate
+                        self.preview_published_at[ident] = now
+                    else:
+                        self.next_preview_at = min(self.next_preview_at or due, due)
+                state['reply_preview'] = self.published_previews.get(ident)
+            signature = json.dumps([self.desktop.connected, self.desktop.error,
+                self.desktop_attention_enabled, self.preferred, states], sort_keys=True, ensure_ascii=False)
             if force or signature != self.last_signature:
                 self.last_signature = signature
                 self.revision += 1
                 self.persist()
                 self.cv.notify_all()
+
+    def timing(self, request_id, phase, now):
+        with self.cv:
+            entry = self.request_timings.get(request_id)
+            if entry is None or phase in entry['phases']:
+                return
+            entry['phases'].add(phase)
+            LOG.info('request_timing correlation=%s phase=%s elapsed_ms=%d',
+                hashlib.sha256(request_id.encode()).hexdigest()[:12], phase,
+                max(0, round((now - entry['received']) * 1000)))
+
+    def observe_timings(self, states, now):
+        for state in states:
+            request_id = state.get('request_id')
+            if state.get('reply_preview'):
+                self.timing(request_id, 'first_body', now)
+            if (state.get('state') in ('completed', 'failed', 'interrupted')
+                    or (state.get('reply_preview') or {}).get('complete')):
+                self.timing(request_id, 'completed', now)
 
     def discover_loop(self):
         was_connected = False
@@ -177,10 +243,16 @@ class SharedAssistant:
             conversations=len(rows), next_cursor=cursor + 20 if cursor + 20 < len(rows) else None)
 
     def snapshot(self, compact=False, thread_id=None):
+        self.publish()
         ident = thread_id or self.preferred
         live = self.desktop.peek(ident)
         if live:
             value = live
+            with self.cv:
+                preview = self.published_previews.get(ident)
+                current = live.get('reply_preview')
+                value['reply_preview'] = (preview if self.preview_identity(preview)
+                    == self.preview_identity(current) else None)
             if not compact:
                 with self.desktop.lock:
                     value['reply'] = self.desktop.sessions[ident].reply
@@ -192,8 +264,9 @@ class SharedAssistant:
                 can_activate=self.desktop.connected)
             if not self.desktop.connected:
                 value['message'] = '电脑客户端未连接，草稿已保留'
+        value.setdefault('reply_preview', None)
         if value.get('readonly'):
-            value.update(pending=[], needs_attention=False)
+            value.update(pending=[], needs_attention=False, reply_preview=None)
             if self.desktop.connected and self.desktop.error:
                 value['message'] = self.desktop.error
         value.update(protocol_version=5, revision=self.revision, **self.preferences())
@@ -283,6 +356,7 @@ class SharedAssistant:
             raise ValueError('请求编号无效')
 
     def send(self, prompt, request_id, new=False, thread_id=None):
+        received_at = time.monotonic()
         self.validate_message(prompt, request_id)
         if not isinstance(new, bool):
             raise ValueError('new 必须为布尔值')
@@ -295,6 +369,11 @@ class SharedAssistant:
             previous = self._receipt(request_id, fingerprint)
             if previous:
                 return dict(self.snapshot(True, previous['thread_id']), accepted_thread_id=previous['thread_id'])
+            with self.cv:
+                self.request_timings[request_id] = dict(received=received_at, phases=set())
+                while len(self.request_timings) > 256:
+                    self.request_timings.popitem(last=False)
+            self.timing(request_id, 'computer_received', received_at)
             rejected = self.store.receipt(request_id) or {}
             # A failed desktop handoff may already have created an empty record.
             # An explicit retry reuses it; it never creates a second conversation.
@@ -309,14 +388,20 @@ class SharedAssistant:
                     self.store.record(request_id, receipt)
                 self.activate(ident)
                 live = self.desktop.peek(ident)
-                if live['state'] in ('running', 'waiting'):
-                    raise DesktopUnavailable('该对话正在执行，请刷新后补充当前回合')
                 with self.desktop.lock:
-                    owner = self.desktop.sessions[ident].owner
+                    session = self.desktop.sessions[ident]
+                    # Turn completion can precede the native runtime-idle patch.
+                    # Publish completion promptly while still refusing a new task
+                    # until the desktop owner has finished transitioning.
+                    if (live['state'] in ('running', 'waiting')
+                            or (session.data.get('threadRuntimeStatus') or {}).get('type') == 'active'):
+                        raise DesktopUnavailable('该对话正在执行，请刷新后补充当前回合')
+                    owner = session.owner
                 sent = True
                 result = self.desktop.request('thread-follower-start-turn', dict(conversationId=ident,
-                    turnStart=dict(request=dict(threadId=ident, input=[dict(type='text', text=prompt)],
+                    turnStart=dict(request=dict(threadId=ident, input=[native_text(prompt)],
                         clientUserMessageId=request_id), context=dict(inheritThreadSettings=True))), owner, timeout=20)
+                self.timing(request_id, 'native_received', time.monotonic())
                 turn = result.get('result', {}).get('result', {}).get('turn', {})
                 receipt.update(status='accepted', turn_id=turn.get('id', ''))
                 self.store.record(request_id, receipt)
@@ -376,7 +461,7 @@ class SharedAssistant:
             self.store.record(request_id, receipt)
             try:
                 self.desktop.request('thread-follower-steer-turn', dict(conversationId=thread_id,
-                    input=[dict(type='text', text=prompt)], restoreMessage=restore, clientUserMessageId=request_id), owner, timeout=15)
+                    input=[native_text(prompt)], restoreMessage=restore, clientUserMessageId=request_id), owner, timeout=15)
                 receipt['status'] = 'accepted'
             except Exception as exc:
                 receipt['status'] = 'rejected' if isinstance(exc, DesktopUnavailable) else 'unknown'

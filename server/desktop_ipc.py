@@ -104,6 +104,11 @@ def patch_value(root, patch):
     return root
 
 
+def native_text(text):
+    """Native owner input, including the desktop renderer's required elements."""
+    return dict(type='text', text=text, text_elements=[])
+
+
 def turns_in(state):
     history = (state.get('turnHistory') or {}).get('history') or {}
     return list(history.get('entitiesByKey', {}).items()) or [
@@ -125,6 +130,11 @@ class Projection:
         self.items = {}
         self.reply = ''
         self.stage = '电脑正在处理'
+        self.current_key = None
+        self.message_items = []
+        self.preview = None
+        self.preview_version = 0
+        self.preview_body_hash = None
 
     def remember_turn(self, key, turn):
         self.turns[key] = {k: turn.get(k) for k in ('turnId', 'status', 'turnStartedAtMs', 'error')}
@@ -137,12 +147,27 @@ class Projection:
             oldest = min(self.turns, key=lambda k: self.turns[k].get('turnStartedAtMs') or 0)
             del self.turns[oldest]
 
+    @staticmethod
+    def project_item(item):
+        # Keep current-turn indexes and public body only. Tool arguments, output
+        # and reasoning text never enter the watch projection.
+        if not isinstance(item, dict):
+            return {}
+        value = {k: item.get(k) for k in ('id', 'type', 'phase')}
+        if item.get('type') == 'agentMessage' and item.get('phase') in (None, 'commentary', 'final_answer'):
+            text = str(item.get('text') or '')
+            value['text'] = text[:20000]
+            value['_text_digest'] = item.get('_text_digest') or hashlib.sha256(text.encode()).hexdigest()
+        if item.get('type') == 'fileChange':
+            changes = item.get('changes') or []
+            if len(json.dumps(changes, ensure_ascii=False)) <= 10000:
+                value['changes'] = changes
+        return value
+
     def remember_item(self, item):
         if not isinstance(item, dict):
             return
         kind = item.get('type')
-        if kind == 'agentMessage' and item.get('phase') != 'commentary':
-            self.reply = str(item.get('text') or '')[:20000]
         if kind == 'fileChange':
             changes = item.get('changes') or []
             detail = json.dumps(changes, ensure_ascii=False)
@@ -156,6 +181,108 @@ class Projection:
         if kind in stages:
             self.stage = stages[kind]
 
+    def clear_body(self):
+        self.message_items = []
+        self.reply = ''
+        self.preview = None
+        self.items.clear()
+        self.stage = '电脑正在处理'
+
+    def select_current(self, source=None):
+        key = max(self.turns, key=lambda k: self.turns[k].get('turnStartedAtMs') or 0, default=None)
+        if key != self.current_key:
+            self.current_key = key
+            self.clear_body()
+        if source is not None and key is not None and key in source:
+            items = source[key].get('items') or []
+            if not isinstance(items, list) or len(items) > 2048:
+                raise ValueError('当前回合消息结构不受支持')
+            self.message_items = [self.project_item(i) for i in items]
+
+    def refresh_body(self):
+        self.reply = ''
+        self.items.clear()
+        body = None
+        for index, item in enumerate(self.message_items):
+            self.remember_item(item)
+            if item.get('type') == 'agentMessage':
+                body = (index, item)
+                if item.get('phase') != 'commentary':
+                    self.reply = item.get('text') or ''
+        candidate = None
+        turn = self.latest_turn()
+        ended = turn.get('status') in ('completed', 'failed', 'interrupted')
+        if (body and body[1].get('text') and body[1].get('id') and turn.get('turnId')
+                and not (ended and body[1].get('phase') == 'commentary')):
+            index, item = body
+            candidate = dict(thread_id=self.data.get('id', ''), turn_id=turn['turnId'],
+                item_id=item['id'], text=item['text'][:1000],
+                complete=ended,
+                clipped=len(item['text']) > 1000)
+        old = {k: v for k, v in (self.preview or {}).items() if k != 'version'} or None
+        body_hash = body[1].get('_text_digest') if candidate else None
+        if candidate != old or body_hash != self.preview_body_hash:
+            self.preview_version += 1
+        self.preview_body_hash = body_hash
+        self.preview = dict(candidate, version=self.preview_version) if candidate else None
+
+    def load_turns(self, entries):
+        previous, previous_hash = self.preview, self.preview_body_hash
+        self.turns.clear()
+        latest = sorted(entries, key=lambda pair: pair[1].get('turnStartedAtMs') or 0)[-4:]
+        self.clear_body()
+        self.current_key = None
+        for key, turn in latest:
+            self.remember_turn(key, turn)
+        self.select_current(dict(latest))
+        self.preview, self.preview_body_hash = previous, previous_hash
+
+    def patch_turn(self, key, path, patch):
+        if not path:
+            if patch['op'] == 'remove':
+                self.turns.pop(key, None)
+                self.select_current()
+            else:
+                self.remember_turn(key, patch['value'])
+                self.select_current({key: patch['value']})
+            return
+        if key not in self.turns:
+            return  # Old turns outside the bounded projection are irrelevant.
+        if len(path) == 1 and path[0] in ('turnId', 'status', 'turnStartedAtMs', 'error'):
+            previous_id = self.latest_turn().get('turnId')
+            self.turns[key][path[0]] = patch.get('value')
+            self.select_current()
+            if previous_id != self.latest_turn().get('turnId'):
+                self.clear_body()
+        elif path == ['params', 'approvalsReviewer']:
+            self.turns[key]['reviewer'] = patch.get('value')
+        elif path == ['params', 'clientUserMessageId']:
+            self.turns[key]['request_id'] = patch.get('value') or ''
+        elif path[0] == 'items' and key == self.current_key:
+            tail = path[1:]
+            if not tail:
+                values = patch.get('value') or []
+                if not isinstance(values, list) or len(values) > 2048:
+                    raise ValueError('当前回合消息结构不受支持')
+                self.message_items = [self.project_item(i) for i in values]
+            elif len(tail) == 1:
+                value = dict(patch, path=tail)
+                if patch['op'] != 'remove':
+                    value['value'] = self.project_item(patch['value'])
+                self.message_items = patch_value(self.message_items, value)
+                if len(self.message_items) > 2048:
+                    raise ValueError('当前回合消息过多')
+            else:
+                index, field = tail[:2]
+                if field in ('id', 'type', 'phase', 'text', 'changes'):
+                    item = self.message_items[index]
+                    if field == 'text' and item.get('type') != 'agentMessage':
+                        return
+                    if field == 'text':
+                        item.pop('_text_digest', None)
+                    item = patch_value(item, dict(patch, path=tail[1:]))
+                    self.message_items[index] = self.project_item(item)
+
     def accept(self, change):
         if change.get('type') == 'snapshot':
             state = change['conversationState']
@@ -165,20 +292,14 @@ class Projection:
             self.requests = state.get('requests') or []
             if not isinstance(self.requests, list):
                 raise ValueError('待确认结构不受支持')
-            self.turns.clear()
-            latest = sorted(turns_in(state), key=lambda pair: pair[1].get('turnStartedAtMs') or 0)[-4:]
-            for key, turn in latest:
-                self.remember_turn(key, turn)
-            if latest:
-                self.reply = ''
-                self.items.clear()
-                for item in latest[-1][1].get('items') or []:
-                    self.remember_item(item)
+            self.load_turns(turns_in(state))
+            self.refresh_body()
             self.revision = change['revision']
             self.valid = True
             return
         if not self.valid or change.get('baseRevision') != self.revision:
             self.valid = False
+            self.clear_body()
             raise ValueError('桌面状态版本不连续')
         for patch in change.get('patches') or []:
             path = patch.get('path') or []
@@ -192,20 +313,20 @@ class Projection:
                 self.data[path[0]] = patch.get('value')
             elif path[0] in self.FIELDS and isinstance(self.data.get(path[0]), (dict, list)):
                 self.data[path[0]] = patch_value(self.data[path[0]], dict(patch, path=path[1:]))
+            elif path in (['turnHistory'], ['turnHistory', 'history'],
+                    ['turnHistory', 'history', 'entitiesByKey']):
+                value = patch.get('value') or {}
+                for field in ('history', 'entitiesByKey')[len(path) - 1:]:
+                    value = value.get(field) or {}
+                self.load_turns(list(value.items()))
             elif path[:3] == ['turnHistory', 'history', 'entitiesByKey'] and len(path) >= 4:
-                key = path[3]
-                if len(path) == 4 and patch.get('op') != 'remove':
-                    self.remember_turn(key, patch['value'])
-                    for item in patch['value'].get('items') or []:
-                        self.remember_item(item)
-                elif key in self.turns and len(path) == 5 and path[4] in ('turnId', 'status', 'turnStartedAtMs', 'error'):
-                    self.turns[key][path[4]] = patch.get('value')
-                elif key in self.turns and path[4:] == ['params', 'approvalsReviewer']:
-                    self.turns[key]['reviewer'] = patch.get('value')
-                elif key in self.turns and 'items' in path and isinstance(patch.get('value'), dict):
-                    self.remember_item(patch['value'])
-            elif path[0] == 'turns' and len(path) == 2 and isinstance(patch.get('value'), dict):
-                self.remember_turn(str(path[1]), patch['value'])
+                self.patch_turn(path[3], path[4:], patch)
+            elif path[0] == 'turns':
+                if len(path) == 1:
+                    self.load_turns([(str(i), t) for i, t in enumerate(patch.get('value') or [])])
+                else:
+                    self.patch_turn(str(path[1]), path[2:], patch)
+        self.refresh_body()
         self.revision = change['revision']
 
     def latest_turn(self):
@@ -264,7 +385,9 @@ class Projection:
         turn = self.latest_turn()
         pending = [v for v, _ in self.pending()]
         runtime = (self.data.get('threadRuntimeStatus') or {}).get('type')
-        state = 'waiting' if pending else 'running' if runtime == 'active' else turn.get('status') or 'idle'
+        terminal = turn.get('status') in ('completed', 'failed', 'interrupted')
+        state = ('waiting' if pending else turn['status'] if terminal else
+            'running' if runtime == 'active' else turn.get('status') or 'idle')
         if state == 'inProgress':
             state = 'running' if runtime == 'active' else 'interrupted'
         message = {'waiting': '等待你确认', 'completed': '任务完成', 'interrupted': '任务已停止',
@@ -276,6 +399,7 @@ class Projection:
             request_id=turn.get('request_id') or '', state=state, message=message,
             summary=self.reply[:180] if state in ('completed', 'failed', 'interrupted') else '',
             task=turn.get('task') or '', pending=pending[:1], pending_count=len(pending),
+            reply_preview=dict(self.preview) if self.preview and connected and self.valid else None,
             needs_attention=state == 'failed' or bool(pending), readonly=not connected or not self.valid,
             desktop=True, source='shared', can_send=connected and self.valid,
             # The current native follower steer RPC has no expectedTurnId. Do not
@@ -437,6 +561,7 @@ class DesktopIPC:
                     state.accept(params['change'])
                 except (ValueError, KeyError, TypeError, IndexError):
                     state.valid = False
+                    state.clear_body()
                     self.follow(ident, state.owner)
                 after = state.snapshot(self.connected)
                 refresh = before['state'] in ('running', 'waiting') and after['state'] not in ('running', 'waiting')

@@ -82,10 +82,13 @@ class ProjectionTests(unittest.TestCase):
         self.assertNotIn('turnHistory', p.data)
         self.assertFalse(p.snapshot()['can_steer'])
 
-    def test_text_patches_do_not_change_watch_snapshot_and_gap_invalidates(self):
+    def test_reasoning_patches_do_not_expose_text_and_gap_invalidates(self):
         p = projection()
-        before = p.snapshot()
         p.accept(dict(type='patches', baseRevision=1, revision=2, patches=[
+            dict(op='add', path=['turnHistory', 'history', 'entitiesByKey', 'latest', 'items', 0],
+                value=dict(type='reasoning', id='reasoning', text='private'))]))
+        before = p.snapshot()
+        p.accept(dict(type='patches', baseRevision=2, revision=3, patches=[
             dict(op='replace', path=['turnHistory', 'history', 'entitiesByKey', 'latest', 'items', 0, 'text'], value='delta')]))
         self.assertEqual(p.snapshot(), before)
         with self.assertRaises(ValueError):
@@ -253,11 +256,14 @@ class SharedTests(unittest.TestCase):
         self.a.stop('pc1', 'turn1')
         self.assertEqual(self.desktop.calls[0][1], dict(conversationId='pc1', mode='user-stop', expectedTurnId='turn1'))
 
-    def test_text_deltas_do_not_advance_bridge_revision(self):
+    def test_reasoning_deltas_do_not_advance_bridge_revision(self):
         self.desktop.sessions['pc1'] = projection()
+        self.desktop.sessions['pc1'].accept(dict(type='patches', baseRevision=1, revision=2, patches=[
+            dict(op='add', path=['turnHistory', 'history', 'entitiesByKey', 'latest', 'items', 0],
+                value=dict(type='reasoning', id='reasoning', text='private'))]))
         self.a.publish()
         before = self.a.revision
-        self.desktop.sessions['pc1'].accept(dict(type='patches', baseRevision=1, revision=2,
+        self.desktop.sessions['pc1'].accept(dict(type='patches', baseRevision=2, revision=3,
             patches=[dict(op='replace', path=['turnHistory', 'history', 'entitiesByKey', 'latest', 'items', 0, 'text'], value='x')]))
         self.a.publish()
         self.assertEqual(self.a.revision, before)
