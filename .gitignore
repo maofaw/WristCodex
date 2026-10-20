@@ -26,4 +26,6 @@ __pycache__/
 **/assistant-state.json
 **/assistant-state.tmp
 **/assistant-state-conversations/
+**/assistant-desktop.json
+**/assistant-desktop.tmp
 **/voice-*.wav

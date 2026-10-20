@@ -24,13 +24,16 @@ public class AssistantActivity extends MainActivity {
   LinearLayout root,composer,pendingPanel;
   ListView list;
   EditText prompt;
-  Button titleBar,mic,sendButton,olderButton,listMore;
+  Button titleBar,mic,sendButton,olderButton,listMore,attentionButton;
   TextView phase;
   JSONObject current=new JSONObject();
+  JSONObject connectionState=new JSONObject();
   ArrayList<JSONObject> rows=new ArrayList<>();
   Rows adapter;
   String viewed="",draftOwner="",viewTitle="日常助手",pendingKey="",historyCursor="",listCursor="",historyStamp="";
-  boolean active,listMode,readOnly,voiceWorking,discardCapture,loadingHistory;
+  boolean active,listMode,attentionMode,readOnly,voiceWorking,discardCapture,loadingHistory;
+  String attentionStamp="";
+  String automaticHint="";
   volatile int navigation;
   Handler ui=new Handler(Looper.getMainLooper());
   VoiceCapture capture=new VoiceCapture();
@@ -70,6 +73,8 @@ public class AssistantActivity extends MainActivity {
     titleBar.setContentDescription(title+"，点按切换对话，长按更多操作");
     root.addView(titleBar,new LinearLayout.LayoutParams(-1,dp(48)));
     phase=label("",12);phase.setTextColor(MUTED);phase.setTypeface(Typeface.MONOSPACE);phase.setMaxLines(2);root.addView(phase);
+    attentionButton=control("待处理",false,()->openAttention(""));attentionButton.setVisibility(View.GONE);
+    root.addView(attentionButton,new LinearLayout.LayoutParams(-1,dp(48)));
     status=label("",12);
     list=new ListView(this);list.setBackgroundColor(Color.BLACK);list.setDivider(null);
     list.setCacheColorHint(Color.BLACK);list.setScrollingCacheEnabled(false);list.setClipToPadding(true);
@@ -82,9 +87,11 @@ public class AssistantActivity extends MainActivity {
   }
   void persistView(){
     prefs.edit().putString("viewedConversation",viewed).putString("viewedTitle",viewTitle).putBoolean("viewedReadonly",readOnly).apply();
+    AssistantMonitor.selectView(viewed);
   }
   void showChat(boolean load){
-    saveDraft();listMode=false;loadingHistory=false;pendingKey="";historyStamp="";historyCursor="";rows.clear();
+    saveDraft();listMode=false;attentionMode=false;loadingHistory=false;pendingKey="";historyStamp="";historyCursor="";rows.clear();
+    if(shared()&&!viewed.equals(current.optString("thread_id")))current=new JSONObject();
     shell(viewTitle+" ▾");
     olderButton=control("加载更早消息",false,()->loadHistory(true));
     LinearLayout headers=new LinearLayout(this);headers.setOrientation(LinearLayout.VERTICAL);
@@ -118,6 +125,7 @@ public class AssistantActivity extends MainActivity {
     updateChat();if(load&&!isNew()&&!viewed.isEmpty())loadHistory(false);
   }
   boolean isNew(){return viewed.startsWith(NEW);}
+  boolean shared(){return connectionState.optInt("protocol_version")>=5;}
   boolean running(){String s=current.optString("state");return s.equals("starting")||s.equals("running")||s.equals("waiting");}
   boolean viewingActive(){
     boolean creating=!get("followRequestId").isEmpty()&&get("followRequestId").equals(current.optString("request_id"))&&viewed.equals(get("followDraft"));
@@ -125,8 +133,8 @@ public class AssistantActivity extends MainActivity {
   }
   void hint(String value){if(status!=null&&!status.getText().toString().equals(value))status.setText(value);}
   void applyState(JSONObject state){
-    if(state.length()==0||state.optLong("revision",-1)<current.optLong("revision",-1))return;
-    current=state;
+    if(state.length()==0||state.optLong("revision",-1)<connectionState.optLong("revision",-1))return;
+    connectionState=state;
     if(!active)return;
     String target=state.optString("thread_id");
     String follow=get("followRequestId"),followView=get("followDraft");
@@ -136,7 +144,14 @@ public class AssistantActivity extends MainActivity {
     }else if(viewed.isEmpty()&&!target.isEmpty()){
       bindCreated(target,state.optString("title","手表对话"));
     }
+    if(!shared()||(!isNew()&&viewed.equals(target))){
+      current=state;if(shared())readOnly=state.optBoolean("readonly",true);
+    }
     if(!listMode)updateChat();
+    else if(attentionMode){
+      String stamp=state.optString("attention_keys");
+      if(!stamp.equals(attentionStamp)){attentionStamp=stamp;loadAttention(listCursor);}
+    }
   }
   void bindCreated(String target,String title){
     if(!listMode)saveDraft();
@@ -155,7 +170,8 @@ public class AssistantActivity extends MainActivity {
   void updateChat(){
     if(listMode||phase==null)return;
     String connection=AssistantMonitor.fresh()?"ONLINE":"OFFLINE";
-    String stage=readOnly?"电脑记录 · 只读":viewingActive()?current.optString("message","就绪"):isNew()?"新对话":"就绪";
+    String stage=isNew()?"新对话":shared()?current.optString("message","正在读取对话"):readOnly?"电脑记录 · 只读":viewingActive()?current.optString("message","就绪"):"就绪";
+    if(shared()&&!connectionState.optBoolean("desktop_connected"))stage="电脑客户端未连接";
     String text=connection+" · "+stage;
     if(!phase.getText().toString().equals(text))phase.setText(text);
     JSONArray pending=viewingActive()?current.optJSONArray("pending"):null;
@@ -164,16 +180,23 @@ public class AssistantActivity extends MainActivity {
     if(!key.equals(pendingKey)){
       pendingKey=key;pendingPanel.removeAllViews();if(item!=null){showPending(item);list.setSelection(0);}
     }
-    boolean blocked=running()&&!viewingActive();
+    int count=connectionState.optInt("attention_count");
+    attentionButton.setVisibility(shared()&&count>0?View.VISIBLE:View.GONE);attentionButton.setText("待处理 · "+count);
+    boolean blocked=!shared()&&running()&&!viewingActive();
+    boolean cannotSteer=shared()&&running()&&!current.optBoolean("can_steer");
     composer.setVisibility(readOnly||item!=null||blocked?View.GONE:View.VISIBLE);
-    sendButton.setEnabled(!busy&&!blocked);sendButton.setAlpha(busy||blocked?0.45f:1f);
+    sendButton.setEnabled(!busy&&!blocked&&!cannotSteer);sendButton.setAlpha(busy||blocked||cannotSteer?0.45f:1f);
     mic.setEnabled(!blocked);
-    boolean returnLink=(blocked||readOnly)&&!current.optString("thread_id").isEmpty();
-    status.setClickable(returnLink);status.setMinimumHeight(returnLink?dp(48):0);status.setTextColor(returnLink?GREEN:MUTED);
-    status.setOnClickListener(v->{if(returnLink)returnToActive();});
-    if(blocked)hint("另一段对话正在执行 · 点此返回");
-    else if(readOnly)hint(returnLink?"电脑记录只读 · 点此返回手表对话":"电脑记录当前只读");
-    else if(status.getText().toString().equals("另一段对话正在执行 · 点此返回"))hint("");
+    boolean activation=shared()&&readOnly&&!viewed.isEmpty()&&!isNew()&&connectionState.optBoolean("desktop_connected");
+    boolean returnLink=!shared()&&(blocked||readOnly)&&!current.optString("thread_id").isEmpty();
+    status.setClickable(returnLink||activation);status.setMinimumHeight(returnLink||activation?dp(48):0);status.setTextColor(returnLink||activation?GREEN:MUTED);
+    status.setOnClickListener(v->{if(activation)activateViewed();else if(returnLink)returnToActive();});
+    String nextHint=blocked?"另一段对话正在执行 · 点此返回":activation?"点此连接电脑中的这段对话":readOnly?
+      (shared()?"请先打开电脑客户端；草稿已保留":returnLink?"电脑记录只读 · 点此返回手表对话":"电脑记录当前只读"):
+      cannotSteer&&item==null?current.optString("steer_unavailable_reason","请等本轮结束后发送；草稿会保留"):"";
+    if(!nextHint.isEmpty())hint(nextHint);
+    else if(status.getText().toString().equals(automaticHint))hint("");
+    automaticHint=nextHint;
     olderButton.setVisibility(historyCursor.isEmpty()||item!=null?View.GONE:View.VISIBLE);
     String stamp=current.optString("thread_id")+":"+current.optString("turn_id")+":"+current.optString("state");
     if(viewingActive()&&!running()&&!stamp.equals(historyStamp)&&!loadingHistory){
@@ -222,7 +245,7 @@ public class AssistantActivity extends MainActivity {
   }
   void openList(){
     if(voiceWorking){hint("请先结束录音并等待识别完成");return;}
-    saveDraft();prompt=null;listMode=true;loadingHistory=false;rows.clear();listCursor="";
+    saveDraft();prompt=null;listMode=true;attentionMode=false;loadingHistory=false;rows.clear();listCursor="";
     shell("对话列表");
     Button create=control("＋ 新建对话",false,this::newConversation);
     list.addHeaderView(create,null,false);
@@ -247,7 +270,7 @@ public class AssistantActivity extends MainActivity {
     });
   }
   void newConversation(){
-    if(running()){hint("请等当前任务结束，或返回后停止任务");return;}
+    if(!shared()&&running()){hint("请等当前任务结束，或返回后停止任务");return;}
     String draft=get("newDraft");
     viewed=draft.isEmpty()?NEW+UUID.randomUUID():draft;viewTitle="新对话";readOnly=false;
     prefs.edit().putString("newDraft",viewed).apply();persistView();showChat(false);hint("第一条消息发送后才创建新对话");
@@ -270,7 +293,8 @@ public class AssistantActivity extends MainActivity {
         h.name.setTextSize(16);h.body.setTextSize(12);
         h.name.setMaxLines(2);h.name.setEllipsize(TextUtils.TruncateAt.END);h.body.setMaxLines(2);
         h.name.setText(row.optString("title"));
-        h.body.setText((row.optBoolean("readonly")?"电脑 · 只读":"手表")+(row.optString("id").equals(viewed)?" · 当前":""));
+        h.body.setText(attentionMode?row.optString("summary")+(row.optInt("count")>1?" · "+row.optInt("count")+" 项":""):
+          (row.optBoolean("readonly")?"只读 · 可尝试连接":row.optString("source").equals("shared")?"电脑 · 可续聊":"手表")+(row.optString("id").equals(viewed)?" · 当前":""));
       }else{
         h.name.setTextSize(12);h.body.setTextSize(15);
         h.name.setMaxLines(1);h.body.setMaxLines(4);h.body.setEllipsize(TextUtils.TruncateAt.END);
@@ -302,7 +326,9 @@ public class AssistantActivity extends MainActivity {
     if(readOnly){hint("电脑对话当前只读");return;}
     if(voiceWorking){hint("请先结束录音并检查文字");return;}
     if(!AssistantMonitor.fresh()){refresh();return;}
-    if(current.optInt("protocol_version")<4){hint("请先更新电脑服务到 v0.4");return;}
+    if(connectionState.optInt("protocol_version")<4){hint("请先更新电脑服务");return;}
+    if(shared()&&!connectionState.optBoolean("desktop_connected")){hint("电脑客户端未连接，草稿已保留");return;}
+    if(shared()&&running()&&!current.optBoolean("can_steer")){hint(current.optString("steer_unavailable_reason","请等本轮结束"));return;}
     if(running()&&!viewingActive()){hint("请等另一段对话执行结束");return;}
     if(running()&&current.optString("turn_id").isEmpty()){hint("正在建立任务，稍后可补充");return;}
     String value=prompt.getText().toString().trim();
@@ -349,22 +375,35 @@ public class AssistantActivity extends MainActivity {
   void showPending(JSONObject item){
     final String thread=current.optString("thread_id"),turn=current.optString("turn_id"),id=item.optString("id");
     TextView question=label(item.optString("summary","需要你决定"),16);question.setTextColor(0xFFFFCC75);pendingPanel.addView(question);
-    if(item.optString("kind").equals("approval")){
+    if(item.optString("kind").equals("manual")){
+      pendingPanel.addView(label("此类操作请在电脑处理",15));
+    }else if(item.optString("kind").equals("approval")){
       addControl(pendingPanel,control("查看操作详情",false,()->showPages("操作详情",item.optString("detail"))));
-      addControl(pendingPanel,control("仅本次允许",true,()->answer(id,"accept",null,thread,turn)));
-      addControl(pendingPanel,control("拒绝",false,()->answer(id,"decline",null,thread,turn)));
+      JSONArray decisions=item.optJSONArray("decisions");
+      if(decisions!=null){
+        for(int n=0;n<decisions.length();n++){
+          JSONObject option=decisions.optJSONObject(n);if(option==null)continue;
+          String decision=option.optString("value");
+          addControl(pendingPanel,control(option.optString("label"),decision.equals("accept"),()->answer(id,decision,null,thread,turn)));
+        }
+      }else{
+        addControl(pendingPanel,control("仅本次允许",true,()->answer(id,"accept",null,thread,turn)));
+        addControl(pendingPanel,control("拒绝",false,()->answer(id,"decline",null,thread,turn)));
+      }
     }else{
       JSONArray questions=item.optJSONArray("questions");Map<String,EditText> values=new LinkedHashMap<>();
       if(questions==null)return;
       for(int i=0;i<questions.length();i++){
         JSONObject q=questions.optJSONObject(i);if(q==null)continue;
-        pendingPanel.addView(label(q.optString("question"),15));
+        if(questions.length()>1||!q.optString("question").equals(item.optString("summary")))
+          pendingPanel.addView(label(q.optString("question"),15));
         EditText input=new EditText(this);input.setTextColor(WHITE);input.setHintTextColor(MUTED);input.setTextSize(15);input.setHint("点选项或输入回答");
         pendingPanel.addView(input);values.put(q.optString("id"),input);
         JSONArray options=q.optJSONArray("options");
         if(options!=null)for(int n=0;n<options.length();n++){
           JSONObject option=options.optJSONObject(n);if(option==null)continue;String text=option.optString("label");
           addControl(pendingPanel,control(text,false,()->{input.setText(text);input.clearFocus();}));
+          if(!option.optString("description").isEmpty())pendingPanel.addView(label(option.optString("description"),13));
         }
       }
       addControl(pendingPanel,control("提交回答",true,()->{
@@ -381,16 +420,17 @@ public class AssistantActivity extends MainActivity {
     try{
       JSONObject body=new JSONObject();body.put("id",id);body.put("thread_id",thread);body.put("turn_id",turn);
       if(decision!=null)body.put("decision",decision);if(answers!=null)body.put("answers",answers);
-      exchange(()->request(endpoint("/assistant/answer"),"POST",body.toString(),get("token")),state->{applyState(state);hint("已收到，继续执行");});
+      exchange(()->request(endpoint("/assistant/answer"),"POST",body.toString(),get("token")),state->{applyState(state);hint("请求已处理");});
     }catch(Exception e){hint("回答未发送");}
   }
   void refresh(){
     if(voiceWorking){hint("请先结束录音");return;}hint("正在检查连接…");
     final int epoch=navigation;
-    query(()->request(url("/assistant/state?compact=1"),"GET","",""),epoch,state->{
+    final String target=viewed;
+    query(()->request(url("/assistant/state?compact=1"+(shared()&&!target.isEmpty()&&!target.startsWith(NEW)?"&thread_id="+enc(target):"")),"GET","",""),epoch,state->{
       AssistantMonitor.connected=true;AssistantMonitor.lastContact=SystemClock.elapsedRealtime();applyState(state);
       hint("连接已恢复");
-      if(listMode)loadConversations("");else if(!isNew())loadHistory(false);
+      if(attentionMode)loadAttention("");else if(listMode)loadConversations("");else if(!isNew())loadHistory(false);
     });
   }
   void returnToActive(){
@@ -399,7 +439,8 @@ public class AssistantActivity extends MainActivity {
   }
   void menu(){
     if(voiceWorking){hint("请先结束录音并等待识别完成");return;}
-    new AlertDialog.Builder(this).setTitle("更多操作").setItems(new String[]{"对话列表","刷新记录与连接","返回执行中的对话","停止当前任务","电脑控制与设置","关闭主动提醒"},(d,n)->{
+    boolean reminders=connectionState.optBoolean("desktop_attention_enabled",true)&&!prefs.getBoolean("desktopLocalMute",false);
+    new AlertDialog.Builder(this).setTitle("更多操作").setItems(new String[]{"对话列表","刷新记录与连接","返回当前对话","停止当前任务","电脑控制与设置","关闭全部主动提醒","待处理（"+connectionState.optInt("attention_count")+"）","电脑确认提醒："+(reminders?"开":"关")},(d,n)->{
       if(n==0)openList();if(n==1)refresh();if(n==2)returnToActive();
       if(n==3){
         if(!viewingActive()||!running()){hint("请先返回执行中的对话");return;}
@@ -410,7 +451,55 @@ public class AssistantActivity extends MainActivity {
       }
       if(n==4)startActivity(new Intent(this,MainActivity.class).putExtra("controls",true));
       if(n==5){stopService(new Intent(this,AssistantMonitor.class));hint("提醒已关闭，下次打开助手时恢复");}
+      if(n==6)openAttention("");
+      if(n==7)toggleDesktopReminders(!reminders);
     }).show();
+  }
+  void toggleDesktopReminders(boolean enabled){
+    if(!shared()){hint("请先更新电脑服务到 v0.5");return;}
+    prefs.edit().putBoolean("desktopLocalMute",!enabled).apply();
+    try{
+      JSONObject body=new JSONObject();body.put("desktop_attention_enabled",enabled);
+      exchange(()->request(endpoint("/assistant/preferences"),"POST",body.toString(),get("token")),state->{
+        applyState(state);hint(enabled?"电脑确认提醒已开启":"电脑确认提醒已关闭，仍可手动处理");
+      });
+    }catch(Exception e){hint("设置未确认，请联网后重试");}
+  }
+  void activateViewed(){
+    if(voiceWorking||viewed.isEmpty()||isNew())return;
+    final String target=viewed;
+    try{
+      JSONObject body=new JSONObject();body.put("thread_id",target);hint("正在电脑连接此对话…");
+      exchange(()->request(endpoint("/assistant/activate"),"POST",body.toString(),get("token")),state->{
+        applyState(state);if(target.equals(viewed)&&!listMode)loadHistory(false);
+      });
+    }catch(Exception e){hint("未能连接此对话");}
+  }
+  void openAttention(String cursor){
+    if(voiceWorking){hint("请先结束录音");return;}
+    saveDraft();prompt=null;listMode=true;attentionMode=true;rows.clear();listCursor=cursor;
+    shell("待处理");attentionButton.setVisibility(View.GONE);
+    list.addHeaderView(control("刷新待处理",false,()->loadAttention("")),null,false);
+    listMore=control("加载更多",false,()->{if(!listCursor.isEmpty())loadAttention(listCursor);});
+    list.addFooterView(listMore,null,false);adapter=new Rows();list.setAdapter(adapter);
+    list.setOnItemClickListener((p,v,pos,id)->{
+      int at=pos-list.getHeaderViewsCount();if(at<0||at>=rows.size())return;
+      JSONObject item=rows.get(at);viewed=item.optString("thread_id");viewTitle=item.optString("title");readOnly=false;
+      persistView();showChat(true);
+    });
+    root.addView(status);status.setMaxLines(2);loadAttention(cursor);
+  }
+  void loadAttention(String cursor){
+    if(!attentionMode)return;
+    final int epoch=navigation;
+    query(()->request(url("/assistant/attention"+(cursor.isEmpty()?"":"?cursor="+enc(cursor))),"GET","",""),epoch,data->{
+      if(!attentionMode)return;rows.clear();JSONArray items=data.optJSONArray("items");
+      if(items!=null)for(int n=0;n<items.length();n++)rows.add(items.optJSONObject(n));
+      listCursor=data.optString("next_cursor","");if(listCursor.equals("null"))listCursor="";
+      listMore.setEnabled(!listCursor.isEmpty());listMore.setText(listCursor.isEmpty()?"已到末尾":"加载更多");
+      phase.setText(data.optInt("total")+" 项等待处理");adapter.notifyDataSetChanged();list.setSelection(0);
+      hint(rows.isEmpty()?"目前没有待确认项":"点对话查看说明和原始选项");
+    });
   }
   void openMessage(JSONObject row){
     if(row.optString("id").startsWith("local:")){hint("消息已发送，完成后可查看记录");return;}
@@ -503,6 +592,7 @@ public class AssistantActivity extends MainActivity {
     if(Build.VERSION.SDK_INT>=27){setShowWhenLocked(attention);setTurnScreenOn(attention);}
     else if(attention)getWindow().addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED|WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
     if(!attention)return;
+    if(intent.getBooleanExtra("inbox",false)){openAttention("");return;}
     String target=intent.getStringExtra("thread_id");if(target==null||target.isEmpty())target=current.optString("thread_id");
     if(!target.isEmpty()&&(!target.equals(viewed)||listMode)){
       discardCapture=true;capture.stop();voiceWorking=false;saveDraft();

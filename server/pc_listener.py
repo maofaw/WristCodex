@@ -14,11 +14,20 @@ import json
 import os
 import hmac
 import ai_bridge
-from codex_session import assistant
+from codex_session import assistant as legacy_assistant
+from shared_assistant import SharedAssistant
 import voice
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+def configured_assistant():
+  # Keep the deployed v0.4 path until the real desktop handoff gate passes.
+  # Checking out development sources must not enable an incomplete backend.
+  return (SharedAssistant(legacy_assistant) if os.environ.get('WATCHREMOTE_DESKTOP_SHARED') == '1'
+          else legacy_assistant)
+
+assistant = configured_assistant()
 
 # same dir first (standalone copy), then repo root (in-repo copy)
 here = Path(__file__).resolve()
@@ -75,12 +84,23 @@ class Handler(BaseHTTPRequestHandler):
     elif url.path == "/ai/status":
       self.reply(200, ai_bridge.display(ai_bridge.snapshot()))
     elif url.path == '/assistant/state':
-      self.reply_json(200,assistant.snapshot(parse_qs(url.query).get('compact',['0'])[0]=='1'))
+      try:
+        query=parse_qs(url.query);compact=query.get('compact',['0'])[0]=='1'
+        if len(query.get('thread_id',[''])[0])>200:raise ValueError('对话编号无效')
+        self.reply_json(200,assistant.snapshot(compact,query['thread_id'][0]) if 'thread_id' in query else assistant.snapshot(compact))
+      except ValueError as exc:self.reply(400,str(exc))
     elif url.path == '/assistant/events':
       try:
         after=int(parse_qs(url.query).get('after',['-1'])[0])
-        self.reply_json(200,assistant.events(after,parse_qs(url.query).get('compact',['0'])[0]=='1'))
+        query=parse_qs(url.query);compact=query.get('compact',['0'])[0]=='1'
+        if len(query.get('thread_id',[''])[0])>200:raise ValueError('对话编号无效')
+        self.reply_json(200,assistant.events(after,compact,query['thread_id'][0]) if 'thread_id' in query else assistant.events(after,compact))
       except ValueError:self.reply(400,'invalid revision')
+    elif url.path == '/assistant/preferences':
+      self.reply_json(200,assistant.preferences())
+    elif url.path == '/assistant/attention':
+      try:self.reply_json(200,assistant.attention(int(parse_qs(url.query).get('cursor',['0'])[0])))
+      except ValueError as exc:self.reply(400,str(exc))
     elif url.path.startswith('/assistant/conversations'):
       try:
         query=parse_qs(url.query);cursor=query.get('cursor',[None])[0]
@@ -129,6 +149,10 @@ class Handler(BaseHTTPRequestHandler):
         self.reply_json(200,assistant.steer(payload.get('prompt'),payload.get('request_id'),payload.get('thread_id'),payload.get('turn_id')))
       elif url.path == '/assistant/stop':
         self.reply_json(200,assistant.stop(payload.get('thread_id'),payload.get('turn_id')))
+      elif url.path == '/assistant/preferences':
+          self.reply_json(200,assistant.update_preferences(payload.get('desktop_attention_enabled')))
+      elif url.path == '/assistant/activate':
+          self.reply_json(200,assistant.activate(payload.get('thread_id')))
       else:
         self.reply(404, 'unknown')
     except (ValueError, UnicodeError) as exc:
@@ -140,4 +164,8 @@ class Handler(BaseHTTPRequestHandler):
     pass
 
 if __name__ == '__main__':
-  ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+  if isinstance(assistant, SharedAssistant):assistant.start()
+  try:
+    ThreadingHTTPServer((BIND, PORT), Handler).serve_forever()
+  finally:
+    if isinstance(assistant, SharedAssistant):assistant.close()

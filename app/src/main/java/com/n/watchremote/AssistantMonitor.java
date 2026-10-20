@@ -6,6 +6,8 @@ import org.json.*;
 import java.net.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.*;
 
 /** One bounded long poll. No microphone, wake lock or periodic UI timer. */
 public class AssistantMonitor extends Service {
@@ -14,10 +16,26 @@ public class AssistantMonitor extends Service {
   public static volatile JSONObject latest=new JSONObject();
   public static volatile boolean connected;
   public static volatile long lastContact;
+  static volatile AssistantMonitor instance;
+  static volatile String selectedThread="";
+  final ExecutorService canceller=Executors.newSingleThreadExecutor();
+  volatile String attentionTarget="";
+  volatile boolean attentionInbox;
   volatile boolean running;
   volatile HttpURLConnection connection;
   Thread listener;
-  @Override public void onCreate(){super.onCreate();
+  static void selectView(String thread){
+    String target=thread.startsWith("new:")?"":thread;
+    if(target.equals(selectedThread))return;selectedThread=target;
+    AssistantMonitor live=instance;
+    if(live!=null){
+      final HttpURLConnection previous=live.connection;
+      if(previous!=null&&!live.canceller.isShutdown())live.canceller.execute(previous::disconnect);
+    }
+  }
+  @Override public void onCreate(){super.onCreate();instance=this;
+    String target=getSharedPreferences("remote",MODE_PRIVATE).getString("viewedConversation","");
+    selectedThread=target.startsWith("new:")?"":target;
     NotificationManager nm=getSystemService(NotificationManager.class);
     NotificationChannel quiet=new NotificationChannel(QUIET,"连接与安静结果",NotificationManager.IMPORTANCE_LOW);
     quiet.enableVibration(false);quiet.setSound(null,null);nm.createNotificationChannel(quiet);
@@ -26,9 +44,7 @@ public class AssistantMonitor extends Service {
     nm.createNotificationChannel(alerts);
   }
   Notification notification(boolean attention,String title,String text){
-    Intent open=new Intent(this,AssistantActivity.class).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP|Intent.FLAG_ACTIVITY_SINGLE_TOP);
-    open.putExtra("attention",attention);
-    open.putExtra("thread_id",latest.optString("thread_id"));
+    Intent open=openIntent(attention);
     PendingIntent pending=PendingIntent.getActivity(this,attention?3:2,open,
       PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
     Notification.Builder b=new Notification.Builder(this,attention?ATTENTION:QUIET)
@@ -36,6 +52,11 @@ public class AssistantMonitor extends Service {
       .setContentIntent(pending).setOnlyAlertOnce(true).setAutoCancel(false);
     if(attention)b.setCategory(Notification.CATEGORY_REMINDER).setFullScreenIntent(pending,true);
     return b.build();
+  }
+  Intent openIntent(boolean attention){
+    return new Intent(this,AssistantActivity.class).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP|Intent.FLAG_ACTIVITY_SINGLE_TOP)
+      .putExtra("attention",attention).putExtra("inbox",attention&&attentionInbox)
+      .putExtra("thread_id",attention&&!attentionTarget.isEmpty()?attentionTarget:latest.optString("thread_id"));
   }
   @Override public int onStartCommand(Intent intent,int flags,int startId){
     if(running)return START_NOT_STICKY;
@@ -64,19 +85,54 @@ public class AssistantMonitor extends Service {
       wake.acquire(1000);wake.release();
       // Some watch builds ignore full-screen notifications. Try the normal activity
       // API once; Android may reject a background launch, leaving the notification.
-      try{startActivity(new Intent(this,AssistantActivity.class).putExtra("attention",true).putExtra("thread_id",latest.optString("thread_id"))
-        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_CLEAR_TOP|Intent.FLAG_ACTIVITY_SINGLE_TOP));
+      try{startActivity(openIntent(true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
       }catch(RuntimeException ignored){}
     }catch(SecurityException ignored){} // The notification remains if the OEM blocks waking.
+  }
+  void desktopAlerts(JSONObject state,android.content.SharedPreferences prefs){
+    NotificationManager nm=getSystemService(NotificationManager.class);
+    boolean enabled=state.optBoolean("desktop_attention_enabled",true);
+    boolean localMute=prefs.getBoolean("desktopLocalMute",false);
+    if(!enabled)prefs.edit().remove("desktopLocalMute").apply();
+    if(!enabled||localMute){nm.cancel(41);return;}
+    JSONArray array=state.optJSONArray("attention_keys"),previews=state.optJSONArray("attention_preview");
+    Set<String> current=new HashSet<>();if(array!=null)for(int i=0;i<array.length();i++)current.add(array.optString(i));
+    Set<String> seen=new HashSet<>(prefs.getStringSet("desktopSeenRequestsV5",Collections.emptySet()));
+    Set<String> fresh=new HashSet<>(current);fresh.removeAll(seen);
+    if(state.optInt("attention_count")==0){
+      if(state.optBoolean("needs_attention")&&state.optString("state").equals("failed")){
+        attentionTarget=state.optString("thread_id");attentionInbox=false;
+        alert(prefs,"desktop-failed:"+attentionTarget+":"+state.optString("turn_id"),"任务需要你处理",state.optString("message"));
+      }else nm.cancel(41);
+      return;
+    }
+    JSONObject first=previews==null?null:previews.optJSONObject(0);
+    if(previews!=null)for(int i=0;i<previews.length();i++){JSONObject entry=previews.optJSONObject(i);if(entry!=null&&fresh.contains(entry.optString("id"))){first=entry;break;}}
+    attentionInbox=state.optInt("attention_conversations")>1;
+    attentionTarget=first==null?"":first.optString("thread_id");
+    String detail=attentionInbox?state.optInt("attention_count")+" 项请求等待你决定":first==null?"点开查看待处理请求":first.optString("summary");
+    if(fresh.isEmpty()){
+      // Refresh an existing card after the computer resolves part of a batch.
+      // Never recreate a dismissed notification or wake the screen again.
+      for(android.service.notification.StatusBarNotification active:nm.getActiveNotifications())
+        if(active.getId()==41){nm.notify(41,notification(true,"电脑需要你决定",detail));break;}
+      return;
+    }
+    seen.addAll(fresh);
+    if(seen.size()>256){Iterator<String> old=seen.iterator();while(old.hasNext()&&seen.size()>256){String key=old.next();if(!current.contains(key))old.remove();}}
+    prefs.edit().putStringSet("desktopSeenRequestsV5",seen).apply();
+    alert(prefs,"desktop:"+Integer.toHexString(fresh.hashCode())+":"+state.optLong("revision"),"电脑需要你决定",detail);
   }
   void listen(){
     android.content.SharedPreferences prefs=getSharedPreferences("remote",MODE_PRIVATE);
     long revision=-1;int failures=0;boolean hadContact=false;String outage=Long.toString(System.currentTimeMillis());
     while(running){
+      final String target=selectedThread;
       try{
         String base=prefs.getString("base",""),token=prefs.getString("token","");
         if(base.isEmpty()||token.isEmpty())throw new IOException("尚未配置电脑");
-        connection=(HttpURLConnection)new URL(base+"/assistant/events?compact=1&after="+revision+"&t="+URLEncoder.encode(token,"UTF-8")).openConnection();
+        connection=(HttpURLConnection)new URL(base+"/assistant/events?compact=1&after="+revision+
+          (target.isEmpty()?"":"&thread_id="+URLEncoder.encode(target,"UTF-8"))+"&t="+URLEncoder.encode(token,"UTF-8")).openConnection();
         connection.setConnectTimeout(5000);connection.setReadTimeout(28000);
         if(connection.getResponseCode()!=200)throw new IOException("连接未成功");
         StringBuilder body=new StringBuilder();
@@ -89,7 +145,9 @@ public class AssistantMonitor extends Service {
         hadContact=true;failures=0;outage=Long.toString(System.currentTimeMillis());
         JSONArray pending=state.optJSONArray("pending");
         NotificationManager nm=getSystemService(NotificationManager.class);
-        if(pending!=null&&pending.length()>0){
+        if(state.optInt("protocol_version")>=5){desktopAlerts(state,prefs);}
+        else if(pending!=null&&pending.length()>0){
+          attentionTarget=state.optString("thread_id");attentionInbox=false;
           JSONObject item=pending.getJSONObject(0);
           alert(prefs,"pending:"+item.optString("id"),"需要你决定",item.optString("summary","有操作需要你确认，点开查看选项"));
         }else if(state.optBoolean("needs_attention",state.optString("state").equals("failed"))){
@@ -100,8 +158,12 @@ public class AssistantMonitor extends Service {
           nm.notify(40,notification(false,"腕上助手 · 已连接",state.optString("message","准备接收任务")));
           broadcast();
         }
+        // A completed response can race a conversation switch without throwing.
+        // Read the newly selected conversation immediately, even at the same revision.
+        if(!target.equals(selectedThread))revision=-1;
       }catch(Exception e){
         if(!running)break;
+        if(!target.equals(selectedThread)){revision=-1;continue;}
         boolean wasConnected=connected;connected=false;failures++;
         if(wasConnected||failures==1){
           getSystemService(NotificationManager.class).notify(40,notification(false,"电脑未连接","未发送的文字会保留，连接恢复后再试"));broadcast();
@@ -113,6 +175,7 @@ public class AssistantMonitor extends Service {
       }finally{if(connection!=null){connection.disconnect();connection=null;}}
     }
   }
-  @Override public void onDestroy(){running=false;connected=false;if(connection!=null)connection.disconnect();if(listener!=null)listener.interrupt();super.onDestroy();}
+  @Override public void onDestroy(){running=false;connected=false;if(instance==this)instance=null;
+    if(connection!=null)connection.disconnect();if(listener!=null)listener.interrupt();canceller.shutdown();super.onDestroy();}
   @Override public IBinder onBind(Intent i){return null;}
 }
