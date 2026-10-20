@@ -269,15 +269,41 @@ class SharedTests(unittest.TestCase):
         self.a.send('原请求', 'v04-request', False, 'old-watch')
         self.assertEqual(self.desktop.calls, [])
 
-    def test_empty_thread_is_unloaded_before_desktop_handoff(self):
+    def test_empty_thread_writer_exits_before_desktop_handoff(self):
         calls = []
-        def rpc(method, params):
-            calls.append(method)
-            return dict(thread=dict(id='empty1')) if method == 'thread/start' else dict(status='unsubscribed')
-        with patch.object(self.legacy, 'ensure'), patch.object(self.legacy, 'call', side_effect=rpc):
+        class Manager:
+            def __enter__(self):
+                calls.append('enter')
+                return self
+            def call(self, method, params):
+                calls.append(method)
+                return dict(thread=dict(id='empty1')) if method in ('thread/start', 'thread/read') else {}
+            def __exit__(self, *args):
+                calls.append('exited')
+        self.a.record_factory = Manager
+        with patch.object(self.legacy, 'ensure') as ensure, patch.object(self.legacy, 'call',
+                return_value=dict(thread=dict(id='persistent-writer'))) as rpc:
             self.assertEqual(self.a.create_empty('新对话'), 'empty1')
-        self.assertEqual(calls, ['thread/start', 'thread/name/set', 'thread/unsubscribe'])
+            ensure.assert_not_called()
+            rpc.assert_not_called()
+        self.assertEqual(calls, ['enter', 'thread/start', 'thread/name/set', 'thread/unsubscribe', 'thread/read', 'exited'])
         self.assertEqual(self.opened, [])
+
+    def test_failed_record_creation_still_exits_without_executing_a_turn(self):
+        calls = []
+        class Manager:
+            def __enter__(self):return self
+            def call(self, method, params):
+                calls.append(method)
+                raise RuntimeError('record creation failed')
+            def __exit__(self, *args):calls.append('exited')
+        self.a.record_factory = Manager
+        with patch.object(self.legacy, 'ensure') as ensure:
+            with self.assertRaisesRegex(RuntimeError, 'record creation failed'):
+                self.a.create_empty('新对话')
+            ensure.assert_not_called()
+        self.assertEqual(calls, ['thread/start', 'exited'])
+        self.assertEqual(self.desktop.calls, [])
 
     def test_failed_handoff_retry_reuses_the_same_empty_record(self):
         with patch.object(self.a, 'create_empty', return_value='pc1') as create, patch.object(

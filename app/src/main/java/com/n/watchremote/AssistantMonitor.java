@@ -125,9 +125,10 @@ public class AssistantMonitor extends Service {
   }
   void listen(){
     android.content.SharedPreferences prefs=getSharedPreferences("remote",MODE_PRIVATE);
-    long revision=-1;int failures=0;boolean hadContact=false;String outage=Long.toString(System.currentTimeMillis());
+    long revision=-1;int failures=0;boolean hadContact=false;String outage=Long.toString(System.currentTimeMillis()),polledThread=null;
     while(running){
       final String target=selectedThread;
+      if(!target.equals(polledThread)){revision=-1;polledThread=target;}
       try{
         String base=prefs.getString("base",""),token=prefs.getString("token","");
         if(base.isEmpty()||token.isEmpty())throw new IOException("尚未配置电脑");
@@ -140,7 +141,7 @@ public class AssistantMonitor extends Service {
           char[] buffer=new char[2048];int n;while((n=r.read(buffer))!=-1){if(body.length()+n>70000)throw new IOException("状态过大");body.append(buffer,0,n);}
         }
         JSONObject state=new JSONObject(body.toString());long next=state.optLong("revision",-1);
-        boolean changed=!connected||revision!=next;
+        boolean changed=!connected||revision!=next||!state.optString("thread_id").equals(latest.optString("thread_id"));
         latest=state;revision=next;connected=true;lastContact=SystemClock.elapsedRealtime();
         hadContact=true;failures=0;outage=Long.toString(System.currentTimeMillis());
         JSONArray pending=state.optJSONArray("pending");
@@ -169,7 +170,9 @@ public class AssistantMonitor extends Service {
           getSystemService(NotificationManager.class).notify(40,notification(false,"电脑未连接","未发送的文字会保留，连接恢复后再试"));broadcast();
         }
         String status=latest.optString("state");
-        if(hadContact&&failures>=3&&(status.equals("running")||status.equals("waiting")||status.equals("starting")))
+        boolean alertsAllowed=latest.optInt("protocol_version")<5||
+          (latest.optBoolean("desktop_attention_enabled",true)&&!prefs.getBoolean("desktopLocalMute",false));
+        if(alertsAllowed&&hadContact&&failures>=3&&(status.equals("running")||status.equals("waiting")||status.equals("starting")))
           alert(prefs,"outage:"+outage,"暂时联系不上电脑","任务状态未知，请检查电脑服务和网络；不会重复发送任务");
         try{Thread.sleep(15000);}catch(InterruptedException ignored){}
       }finally{if(connection!=null){connection.disconnect();connection=null;}}

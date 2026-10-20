@@ -169,7 +169,9 @@ public class MainActivity extends Activity {
   }
   static String request(String value,String method,String body,String bearer)throws Exception {
     HttpURLConnection c=(HttpURLConnection)validate(value).openConnection();
-    c.setInstanceFollowRedirects(false); c.setConnectTimeout(4000); c.setReadTimeout(8000);
+    c.setInstanceFollowRedirects(false); c.setConnectTimeout(4000);
+    String path=c.getURL().getPath();
+    c.setReadTimeout(path.equals("/assistant/send")||path.equals("/assistant/activate")?60000:8000);
     c.setRequestMethod("POST".equals(method)?"POST":"GET");
     if(!bearer.isEmpty())c.setRequestProperty("Authorization","Bearer "+bearer);
     try {

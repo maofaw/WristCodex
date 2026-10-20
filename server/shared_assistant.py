@@ -9,6 +9,7 @@ from urllib.parse import quote
 
 from conversations import Conversations
 from desktop_ipc import DesktopIPC, DesktopUnavailable, DeliveryUnknown
+from record_manager import RecordManager
 from ai_bridge import WORKSPACE
 
 
@@ -38,7 +39,7 @@ class SharedConversations(Conversations):
 
 
 class SharedAssistant:
-    def __init__(self, legacy, file=None, desktop=None, open_thread=None):
+    def __init__(self, legacy, file=None, desktop=None, open_thread=None, record_factory=None):
         self.legacy = legacy
         self.store = legacy.store
         self.file = Path(file or legacy.file.with_name('assistant-desktop.json'))
@@ -56,6 +57,7 @@ class SharedAssistant:
         self.desktop_attention_enabled = saved.get('desktop_attention_enabled', True)
         self.desktop = desktop or DesktopIPC(self.changed_event.set)
         self.open_thread = open_thread or (lambda ident: os.startfile('codex://threads/' + quote(ident, safe='')))
+        self.record_factory = record_factory or RecordManager
         self.conversations = SharedConversations(self)
         self.last_signature = ''
 
@@ -67,7 +69,7 @@ class SharedAssistant:
                 desktop_attention_enabled=self.desktop_attention_enabled)), encoding='utf-8')
             temp.replace(self.file)
 
-    # This app-server is used for persisted history and empty-record creation only.
+    # This long-lived app-server is used for persisted history only.
     # Existing desktop conversations are NEVER resumed or executed through it.
     def ensure(self):
         self.legacy.ensure()
@@ -246,11 +248,16 @@ class SharedAssistant:
     def create_empty(self, title):
         if not self.desktop.connected:
             raise DesktopUnavailable('电脑客户端未连接')
-        self.legacy.ensure()
-        result = self.legacy.call('thread/start', dict(cwd=str(WORKSPACE), ephemeral=False))
-        ident = result['thread']['id']
-        self.legacy.call('thread/name/set', dict(threadId=ident, name=title[:80]))
-        self.legacy.call('thread/unsubscribe', dict(threadId=ident))
+        # Unsubscribing alone leaves an active writer. The short-lived manager
+        # must exit before the desktop is asked to own this same conversation.
+        with self.record_factory() as manager:
+            result = manager.call('thread/start', dict(cwd=str(WORKSPACE), ephemeral=False))
+            ident = result['thread']['id']
+            manager.call('thread/name/set', dict(threadId=ident, name=title[:80]))
+            manager.call('thread/unsubscribe', dict(threadId=ident))
+            persisted = manager.call('thread/read', dict(threadId=ident, includeTurns=False))
+            if persisted['thread']['id'] != ident:
+                raise RuntimeError('空会话记录编号不一致，任务未执行')
         self.store.register(ident, title)
         return ident
 

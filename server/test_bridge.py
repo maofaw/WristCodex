@@ -20,6 +20,23 @@ class BridgeTests(unittest.TestCase):
     def tearDown(self):
         bridge.STATE, bridge.JOB = self.old
         self.tmp.cleanup()
+
+    def test_legacy_backend_accepts_a_shared_client_view_selector(self):
+        assistant = Assistant(Path(self.tmp.name) / 'legacy.json')
+        server = ThreadingHTTPServer(('127.0.0.1', 0), pc_listener.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = 'http://127.0.0.1:' + str(server.server_port)
+        try:
+            with patch.object(pc_listener, 'assistant', assistant):
+                for route in ('state?compact=1', 'events?after=-1&compact=1'):
+                    try:
+                        value = json.load(urlopen(base + '/assistant/' + route + '&thread_id=old-view&t=' + pc_listener.TOKEN))
+                    except Exception as exc:
+                        self.fail('Legacy backend must remain reachable with a saved view selector: ' + str(exc))
+                    self.assertEqual(value['protocol_version'], 4)
+        finally:
+            server.shutdown(); server.server_close(); thread.join()
     def test_validation_dedup_and_busy(self):
         with self.assertRaises(ValueError): bridge.submit('', 'x')
         with patch.object(threading.Thread, 'start'):

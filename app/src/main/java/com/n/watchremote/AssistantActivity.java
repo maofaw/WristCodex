@@ -33,6 +33,7 @@ public class AssistantActivity extends MainActivity {
   String viewed="",draftOwner="",viewTitle="日常助手",pendingKey="",historyCursor="",listCursor="",historyStamp="";
   boolean active,listMode,attentionMode,readOnly,voiceWorking,discardCapture,loadingHistory;
   String attentionStamp="";
+  String attentionPage="";
   String automaticHint="";
   volatile int navigation;
   Handler ui=new Handler(Looper.getMainLooper());
@@ -139,6 +140,10 @@ public class AssistantActivity extends MainActivity {
     String target=state.optString("thread_id");
     String follow=get("followRequestId"),followView=get("followDraft");
     if(!target.isEmpty()&&(!follow.isEmpty()&&follow.equals(state.optString("request_id")))){
+      try{
+        JSONObject sent=new JSONObject(get("pending:"+followView));
+        if(follow.equals(sent.optString("request_id")))acknowledgeDraft(followView,target,sent.optString("prompt"),follow);
+      }catch(JSONException ignored){}
       if(viewed.equals(followView)||viewed.isEmpty())bindCreated(target,state.optString("title","手表对话"));
       prefs.edit().remove("followRequestId").remove("followDraft").apply();
     }else if(viewed.isEmpty()&&!target.isEmpty()){
@@ -150,7 +155,20 @@ public class AssistantActivity extends MainActivity {
     if(!listMode)updateChat();
     else if(attentionMode){
       String stamp=state.optString("attention_keys");
-      if(!stamp.equals(attentionStamp)){attentionStamp=stamp;loadAttention(listCursor);}
+      if(!stamp.equals(attentionStamp)){attentionStamp=stamp;loadAttention(attentionPage);}
+    }
+  }
+  void acknowledgeDraft(String origin,String accepted,String value,String requestId){
+    boolean here=viewed.equals(origin)||(!accepted.isEmpty()&&viewed.equals(accepted));
+    if(here&&!listMode)saveDraft();
+    for(String target:new String[]{origin,accepted}){
+      if(!target.isEmpty()&&get("draft:"+target).trim().equals(value))prefs.edit().putString("draft:"+target,"").apply();
+    }
+    try{if(requestId.equals(new JSONObject(get("pending:"+origin)).optString("request_id")))
+      prefs.edit().remove("pending:"+origin).apply();}catch(JSONException ignored){}
+    if(here&&!listMode&&prompt!=null&&prompt.getText().toString().trim().equals(value)){
+      prompt.setText("");prompt.clearFocus();
+      ((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(prompt.getWindowToken(),0);
     }
   }
   void bindCreated(String target,String title){
@@ -350,17 +368,11 @@ public class AssistantActivity extends MainActivity {
       if(kind.equals("new"))prefs.edit().putString("followRequestId",requestId).putString("followDraft",origin).apply();
       hint("正在发送…");
       exchange(()->request(endpoint(kind.equals("steer")?"/assistant/steer":"/assistant/send"),"POST",body,get("token")),state->{
-        if(!listMode&&origin.equals(viewed))saveDraft();
-        if(get(draft).trim().equals(value))prefs.edit().putString(draft,"").apply();
-        if(get(pending).equals(body))prefs.edit().remove(pending).apply();
-        boolean stillHere=origin.equals(viewed);
-        if(stillHere&&!listMode&&prompt.getText().toString().trim().equals(value)){
-          prompt.setText("");prompt.clearFocus();
-          ((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(prompt.getWindowToken(),0);
-        }
         String accepted=state.optString("accepted_thread_id");
         if(accepted.isEmpty()&&requestId.equals(state.optString("request_id")))accepted=state.optString("thread_id");
-        if(stillHere&&!accepted.isEmpty())bindCreated(accepted,accepted.equals(state.optString("thread_id"))?state.optString("title",viewTitle):viewTitle);
+        boolean stillHere=origin.equals(viewed)||(kind.equals("new")&&!accepted.isEmpty()&&viewed.equals(accepted));
+        acknowledgeDraft(origin,accepted,value,requestId);
+        if(stillHere&&!accepted.isEmpty()&&!accepted.equals(viewed))bindCreated(accepted,accepted.equals(state.optString("thread_id"))?state.optString("title",viewTitle):viewTitle);
         applyState(state);
         if(active&&!listMode&&stillHere){
           try{JSONObject row=new JSONObject();row.put("id","local:"+requestId);row.put("role","user");row.put("text",value.substring(0,Math.min(value.length(),180)));
@@ -491,9 +503,13 @@ public class AssistantActivity extends MainActivity {
   }
   void loadAttention(String cursor){
     if(!attentionMode)return;
+    attentionPage=cursor;
     final int epoch=navigation;
     query(()->request(url("/assistant/attention"+(cursor.isEmpty()?"":"?cursor="+enc(cursor))),"GET","",""),epoch,data->{
-      if(!attentionMode)return;rows.clear();JSONArray items=data.optJSONArray("items");
+      if(!attentionMode||!attentionPage.equals(cursor))return;
+      JSONArray items=data.optJSONArray("items");
+      if(!cursor.isEmpty()&&data.optInt("total")>0&&(items==null||items.length()==0)){loadAttention("");return;}
+      rows.clear();
       if(items!=null)for(int n=0;n<items.length();n++)rows.add(items.optJSONObject(n));
       listCursor=data.optString("next_cursor","");if(listCursor.equals("null"))listCursor="";
       listMore.setEnabled(!listCursor.isEmpty());listMore.setText(listCursor.isEmpty()?"已到末尾":"加载更多");

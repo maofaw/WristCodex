@@ -87,14 +87,14 @@ class Handler(BaseHTTPRequestHandler):
       try:
         query=parse_qs(url.query);compact=query.get('compact',['0'])[0]=='1'
         if len(query.get('thread_id',[''])[0])>200:raise ValueError('对话编号无效')
-        self.reply_json(200,assistant.snapshot(compact,query['thread_id'][0]) if 'thread_id' in query else assistant.snapshot(compact))
+        self.reply_json(200,assistant.snapshot(compact,query['thread_id'][0]) if isinstance(assistant,SharedAssistant) and 'thread_id' in query else assistant.snapshot(compact))
       except ValueError as exc:self.reply(400,str(exc))
     elif url.path == '/assistant/events':
       try:
         after=int(parse_qs(url.query).get('after',['-1'])[0])
         query=parse_qs(url.query);compact=query.get('compact',['0'])[0]=='1'
         if len(query.get('thread_id',[''])[0])>200:raise ValueError('对话编号无效')
-        self.reply_json(200,assistant.events(after,compact,query['thread_id'][0]) if 'thread_id' in query else assistant.events(after,compact))
+        self.reply_json(200,assistant.events(after,compact,query['thread_id'][0]) if isinstance(assistant,SharedAssistant) and 'thread_id' in query else assistant.events(after,compact))
       except ValueError:self.reply(400,'invalid revision')
     elif url.path == '/assistant/preferences':
       self.reply_json(200,assistant.preferences())
