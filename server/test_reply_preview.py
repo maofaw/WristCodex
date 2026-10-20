@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from desktop_ipc import DesktopUnavailable, Projection
+from desktop_ipc import DesktopIPC, DesktopUnavailable, Projection
 import test_shared_assistant as fixtures
 from test_shared_assistant import projection, state, command
 
@@ -156,6 +156,71 @@ class ReplyPreviewTests(unittest.TestCase):
             self.assertIsNone(p.snapshot(False)['reply_preview'])
 
 
+class StartOrderingTests(unittest.TestCase):
+    def test_turn_arrives_before_runtime_active_is_starting_until_real_terminal(self):
+        p = projection(status='idle')
+        change(p, dict(op='add', path=PREFIX[:-1] + ['second'], value=dict(
+            turnId='turn2', turnStartedAtMs=200, status='inProgress', params={}, items=[])))
+        pending = p.snapshot()
+        self.assertEqual(pending['state'], 'starting')
+        self.assertFalse(pending['can_send'])
+        self.assertEqual(pending['summary'], '')
+        self.assertFalse(pending['needs_attention'])
+        change(p, dict(op='replace', path=['threadRuntimeStatus', 'type'], value='active'))
+        self.assertEqual(p.snapshot()['state'], 'running')
+        self.assertFalse(p.snapshot()['can_send'])
+        second = PREFIX[:-1] + ['second']
+        change(p, dict(op='add', path=second + ['items', 0], value=message('received 7')),
+            dict(op='replace', path=second + ['status'], value='completed'))
+        self.assertEqual(p.snapshot()['state'], 'completed')
+        self.assertTrue(p.snapshot()['reply_preview']['complete'])
+        self.assertFalse(p.snapshot()['can_send'])
+        change(p, dict(op='replace', path=['threadRuntimeStatus', 'type'], value='idle'))
+        self.assertTrue(p.snapshot()['can_send'])
+
+    def test_owner_replacement_preserves_only_accepted_start_reservation(self):
+        ipc = DesktopIPC()
+        ipc.connected = True
+        old = projection(status='idle')
+        old.expect_turn('expected', 'accepted', 'turn1', 'task')
+        ipc.sessions['pc1'] = old
+        def snapshot_from_new_owner(ident, owner):
+            ipc.sessions[ident].accept(dict(type='snapshot', revision=1,
+                conversationState=state(status='idle')))
+        try:
+            with patch.object(ipc, 'request', return_value=dict(handledByClientId='owner2')), patch.object(
+                    ipc, 'follow', side_effect=snapshot_from_new_owner):
+                current = ipc.discover('pc1')
+            self.assertIsNot(current, old)
+            self.assertEqual(current.owner, 'owner2')
+            self.assertEqual(current.snapshot()['state'], 'starting')
+            self.assertEqual(current.snapshot()['turn_id'], 'expected')
+            self.assertFalse(current.snapshot()['can_send'])
+            self.assertIsNone(current.snapshot()['reply_preview'])
+        finally:
+            ipc.close()
+
+    def test_stale_inprogress_snapshot_and_owner_loss_never_offer_a_new_send(self):
+        raw = state(status='idle')
+        raw['turnHistory']['history']['entitiesByKey']['latest']['status'] = 'inProgress'
+        p = Projection('owner')
+        p.accept(dict(type='snapshot', revision=1, conversationState=raw))
+        self.assertEqual(p.snapshot()['state'], 'starting')
+        self.assertFalse(p.snapshot()['can_send'])
+        self.assertFalse(p.snapshot()['needs_attention'])
+        p.valid = False
+        self.assertTrue(p.snapshot()['readonly'])
+        self.assertFalse(p.snapshot()['can_send'])
+        self.assertIsNone(p.snapshot()['reply_preview'])
+        self.assertTrue(p.snapshot(False)['readonly'])
+        self.assertFalse(p.snapshot(False)['can_send'])
+        change_status = state(status='idle')
+        change_status['turnHistory']['history']['entitiesByKey']['latest']['status'] = 'interrupted'
+        p.accept(dict(type='snapshot', revision=2, conversationState=change_status))
+        self.assertEqual(p.snapshot()['state'], 'interrupted')
+        self.assertTrue(p.snapshot()['can_send'])
+
+
 class RetryStageTests(unittest.TestCase):
     @staticmethod
     def retry():
@@ -220,6 +285,117 @@ class RetryStageTests(unittest.TestCase):
 class StreamingTests(unittest.TestCase):
     setUp = fixtures.SharedTests.setUp
     tearDown = fixtures.SharedTests.tearDown
+    def test_invalidated_idle_owner_never_accepts_another_native_write(self):
+        self.desktop.sessions['pc1'].valid = False
+        with self.assertRaises(DesktopUnavailable):
+            self.a.send('another task', 'invalid-owner', False, 'pc1')
+        self.assertEqual(self.desktop.calls, [])
+
+    def test_initial_start_ordering_blocks_another_native_write(self):
+        p = self.desktop.sessions['pc1'] = projection(status='idle')
+        change(p, dict(op='replace', path=PREFIX + ['status'], value='inProgress'))
+        with self.assertRaises(DesktopUnavailable):
+            self.a.send('another task', 'must-not-send', False, 'pc1')
+        self.assertEqual(self.desktop.calls, [])
+
+    def test_native_ack_starting_response_cannot_offer_send_or_stale_preview(self):
+        p = self.desktop.sessions['pc1']
+        change(p, dict(op='add', path=PREFIX + ['items', 0], value=message('old final')))
+        result = self.a.send('new task', 'start-ack', False, 'pc1')
+        self.assertEqual(result['state'], 'starting')
+        self.assertFalse(result['can_send'])
+        self.assertIsNone(result['reply_preview'])
+        self.assertEqual(result['summary'], '')
+
+    def test_accepted_ack_remains_starting_until_native_turn_arrives(self):
+        p = self.desktop.sessions['pc1']
+        change(p, dict(op='add', path=PREFIX + ['items', 0], value=message('old final')))
+        self.a.send('new task', 'accepted-start', False, 'pc1')
+        pending = self.a.snapshot(True, 'pc1')
+        self.assertEqual(pending['state'], 'starting')
+        self.assertEqual(pending['turn_id'], 'new-turn')
+        self.assertEqual(pending['request_id'], 'accepted-start')
+        self.assertFalse(pending['can_send'])
+        self.assertIsNone(pending['reply_preview'])
+        self.assertEqual(pending['summary'], '')
+        # A retry of the accepted request is acknowledged, while a second task
+        # cannot pass the native guard during the delayed follower snapshot.
+        self.a.send('new task', 'accepted-start', False, 'pc1')
+        with self.assertRaises(DesktopUnavailable):
+            self.a.send('different task', 'different-start', False, 'pc1')
+        self.assertEqual(len(self.desktop.calls), 1)
+        change(p, dict(op='add', path=PREFIX[:-1] + ['second'], value=dict(
+            turnId='new-turn', turnStartedAtMs=200, status='inProgress',
+            params=dict(clientUserMessageId='accepted-start'), items=[])))
+        self.assertEqual(self.a.snapshot(True, 'pc1')['state'], 'starting')
+        second = PREFIX[:-1] + ['second']
+        change(p, dict(op='add', path=second + ['items', 0], value=message('new final')),
+            dict(op='replace', path=second + ['status'], value='completed'))
+        final = self.a.snapshot(True, 'pc1')
+        self.assertEqual(final['state'], 'completed')
+        self.assertTrue(final['can_send'])
+        self.assertEqual(final['reply_preview']['text'], 'new final')
+
+    def test_accepted_start_owner_loss_is_readonly_until_authoritative_turn(self):
+        p = self.desktop.sessions['pc1']
+        self.a.send('new task', 'lost-owner-start', False, 'pc1')
+        p.valid = False
+        self.desktop.connected = False
+        lost = self.a.snapshot(True, 'pc1')
+        self.assertTrue(lost['readonly'])
+        self.assertFalse(lost['can_send'])
+        self.assertIsNone(lost['reply_preview'])
+        # A stale historical snapshot after reconnect cannot complete the new turn.
+        p.accept(dict(type='snapshot', revision=10, conversationState=state(status='idle')))
+        self.desktop.connected = True
+        self.assertEqual(self.a.snapshot(True, 'pc1')['state'], 'starting')
+        older = state(status='idle')
+        old_turn = older['turnHistory']['history']['entitiesByKey']['latest']
+        old_turn.update(turnId='older-history', turnStartedAtMs=50)
+        p.accept(dict(type='snapshot', revision=11, conversationState=older))
+        self.assertEqual(self.a.snapshot(True, 'pc1')['state'], 'starting')
+        self.assertFalse(self.a.snapshot(True, 'pc1')['can_send'])
+        raw = state(status='idle')
+        turn = raw['turnHistory']['history']['entitiesByKey']['latest']
+        turn.update(turnId='new-turn', status='completed', items=[message('completed')])
+        p.accept(dict(type='snapshot', revision=12, conversationState=raw))
+        final = self.a.snapshot(True, 'pc1')
+        self.assertEqual(final['state'], 'completed')
+        self.assertTrue(final['can_send'])
+        self.assertEqual(final['reply_preview']['turn_id'], 'new-turn')
+
+    def test_owner_replacement_during_ack_cannot_reenable_stale_history(self):
+        request = self.desktop.request
+        def new_owner_before_ack(*args, **kwargs):
+            new = projection(status='idle')
+            new.owner = 'owner2'
+            self.desktop.sessions['pc1'] = new
+            return request(*args, **kwargs)
+        with patch.object(self.desktop, 'request', side_effect=new_owner_before_ack):
+            self.a.send('task', 'owner-change-start', False, 'pc1')
+        current = self.a.snapshot(True, 'pc1')
+        self.assertEqual(current['state'], 'starting')
+        self.assertEqual(current['turn_id'], 'new-turn')
+        self.assertFalse(current['can_send'])
+        self.assertIsNone(current['reply_preview'])
+        with self.assertRaises(DesktopUnavailable):
+            self.a.send('another task', 'owner-change-second', False, 'pc1')
+        self.assertEqual(len(self.desktop.calls), 1)
+
+    def test_native_completion_before_ack_is_not_overwritten_by_start_marker(self):
+        p = self.desktop.sessions['pc1']
+        request = self.desktop.request
+        def completed_before_ack(*args, **kwargs):
+            change(p, dict(op='add', path=PREFIX[:-1] + ['second'], value=dict(
+                turnId='new-turn', turnStartedAtMs=200, status='completed', params={},
+                items=[message('already completed')])) )
+            return request(*args, **kwargs)
+        with patch.object(self.desktop, 'request', side_effect=completed_before_ack):
+            result = self.a.send('fast task', 'fast-start', False, 'pc1')
+        self.assertEqual(result['state'], 'completed')
+        self.assertTrue(result['can_send'])
+        self.assertTrue(result['reply_preview']['complete'])
+
     def test_terminal_status_does_not_allow_send_while_native_runtime_is_active(self):
         p = self.desktop.sessions['pc1'] = projection()
         change(p, dict(op='replace', path=PREFIX + ['status'], value='completed'))

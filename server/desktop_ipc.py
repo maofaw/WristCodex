@@ -135,6 +135,7 @@ class Projection:
         self.preview = None
         self.preview_version = 0
         self.preview_body_hash = None
+        self.starting_turn = None
 
     def remember_turn(self, key, turn):
         self.turns[key] = {k: turn.get(k) for k in ('turnId', 'status', 'turnStartedAtMs', 'error')}
@@ -401,17 +402,47 @@ class Projection:
             result.append((view, request))
         return result
 
+    def expect_turn(self, turn_id, request_id, previous_turn_id, task, previous_started_at=None):
+        # The native ACK can precede its follower turn snapshot. Reserve the
+        # accepted turn against stale historical completion and another send.
+        turn = self.latest_turn()
+        current_id = turn.get('turnId') or ''
+        previous_started_at = ((turn.get('turnStartedAtMs') or 0) if previous_started_at is None
+            else previous_started_at)
+        if ((not turn_id or current_id != turn_id)
+                and (current_id == previous_turn_id or not current_id
+                    or (turn.get('turnStartedAtMs') or 0) <= previous_started_at)):
+            self.starting_turn = dict(turn_id=turn_id, request_id=request_id,
+                previous_turn_id=previous_turn_id, previous_started_at=previous_started_at, task=task[:300])
+
     def snapshot(self, connected=True):
         turn = self.latest_turn()
+        starting = self.starting_turn
+        if starting and turn.get('turnId') and (turn['turnId'] == starting['turn_id']
+                or (turn['turnId'] != starting['previous_turn_id']
+                    and (turn.get('turnStartedAtMs') or 0) > starting['previous_started_at'])):
+            # An authoritative new turn, including completion before its ACK,
+            # takes precedence over our local reservation.
+            self.starting_turn = starting = None
         pending = [v for v, _ in self.pending()]
+        if starting:
+            turn = dict(turn, turnId=starting['turn_id'], request_id=starting['request_id'],
+                status='inProgress', task=starting['task'])
+            pending = [v for v in pending if v['turn_id'] == starting['turn_id']]
         runtime = (self.data.get('threadRuntimeStatus') or {}).get('type')
         terminal = turn.get('status') in ('completed', 'failed', 'interrupted')
         state = ('waiting' if pending else turn['status'] if terminal else
             'running' if runtime == 'active' else turn.get('status') or 'idle')
+        if starting and not pending:
+            state = 'starting'
         if state == 'inProgress':
-            state = 'running' if runtime == 'active' else 'interrupted'
-        message = {'waiting': '等待你确认', 'completed': '任务完成', 'interrupted': '任务已停止',
+            # Native turn creation and runtime-active arrive independently. An
+            # idle runtime does not prove interruption of an in-progress turn.
+            state = 'running' if runtime == 'active' else 'starting'
+        message = {'starting': '等待电脑同步回合状态', 'waiting': '等待你确认', 'completed': '任务完成', 'interrupted': '任务已停止',
             'failed': '执行失败', 'idle': '就绪'}.get(state, self.stage)
+        if starting and not pending:
+            message = '电脑已接收，等待回合同步'
         if not connected or not self.valid:
             message = '电脑客户端未连接，草稿已保留'
         return dict(thread_id=self.data.get('id', ''), title=self.data.get('title') or '电脑对话',
@@ -419,9 +450,11 @@ class Projection:
             request_id=turn.get('request_id') or '', state=state, message=message,
             summary=self.reply[:180] if state in ('completed', 'failed', 'interrupted') else '',
             task=turn.get('task') or '', pending=pending[:1], pending_count=len(pending),
-            reply_preview=dict(self.preview) if self.preview and connected and self.valid else None,
+            reply_preview=(dict(self.preview) if self.preview and connected and self.valid
+                and not starting else None),
             needs_attention=state == 'failed' or bool(pending), readonly=not connected or not self.valid,
-            desktop=True, source='shared', can_send=connected and self.valid,
+            desktop=True, source='shared', can_send=(connected and self.valid
+                and state not in ('starting', 'running', 'waiting') and runtime != 'active'),
             # The current native follower steer RPC has no expectedTurnId. Do not
             # risk steering a replacement turn if the owner changes it in flight.
             can_steer=False, steer_unavailable_reason='电脑当前接口不支持绑定回合的补充，请等本轮结束')
@@ -494,7 +527,10 @@ class DesktopIPC:
         with self.lock:
             current = self.sessions.get(ident)
             if current is None or current.owner != owner:
-                self.sessions[ident] = Projection(owner)
+                replacement = Projection(owner)
+                if current and current.starting_turn:
+                    replacement.starting_turn = dict(current.starting_turn)
+                self.sessions[ident] = replacement
             elif current.valid:
                 return current
         self.follow(ident, owner)

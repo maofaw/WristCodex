@@ -390,19 +390,26 @@ class SharedAssistant:
                 live = self.desktop.peek(ident)
                 with self.desktop.lock:
                     session = self.desktop.sessions[ident]
+                    live = session.snapshot(self.desktop.connected)
                     # Turn completion can precede the native runtime-idle patch.
                     # Publish completion promptly while still refusing a new task
                     # until the desktop owner has finished transitioning.
-                    if (live['state'] in ('running', 'waiting')
-                            or (session.data.get('threadRuntimeStatus') or {}).get('type') == 'active'):
+                    if not live.get('can_send'):
                         raise DesktopUnavailable('该对话正在执行，请刷新后补充当前回合')
                     owner = session.owner
+                    previous_turn_id = live['turn_id']
+                    previous_started_at = session.latest_turn().get('turnStartedAtMs') or 0
                 sent = True
                 result = self.desktop.request('thread-follower-start-turn', dict(conversationId=ident,
                     turnStart=dict(request=dict(threadId=ident, input=[native_text(prompt)],
                         clientUserMessageId=request_id), context=dict(inheritThreadSettings=True))), owner, timeout=20)
                 self.timing(request_id, 'native_received', time.monotonic())
                 turn = result.get('result', {}).get('result', {}).get('turn', {})
+                with self.desktop.lock:
+                    current = self.desktop.sessions.get(ident)
+                    if current is not None:
+                        current.expect_turn(turn.get('id', ''), request_id, previous_turn_id, prompt,
+                            previous_started_at)
                 receipt.update(status='accepted', turn_id=turn.get('id', ''))
                 self.store.record(request_id, receipt)
                 self.preferred = ident
@@ -410,7 +417,8 @@ class SharedAssistant:
                 value = self.snapshot(True, ident)
                 value.update(accepted_thread_id=ident, request_id=request_id)
                 if turn.get('id') and value.get('turn_id') != turn['id']:
-                    value.update(turn_id=turn['id'], state='starting', message='电脑已接收')
+                    value.update(turn_id=turn['id'], state='starting', message='电脑已接收',
+                        can_send=False, reply_preview=None, summary='', task=prompt[:300])
                 return value
             except Exception as exc:
                 receipt['status'] = 'unknown' if sent and not isinstance(exc, DesktopUnavailable) else 'rejected'
