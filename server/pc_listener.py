@@ -24,10 +24,8 @@ from urllib.parse import urlparse, parse_qs
 def configured_assistant():
   # Keep the deployed v0.4 path until the real desktop handoff gate passes.
   # Checking out development sources must not enable an incomplete backend.
-  return (SharedAssistant(legacy_assistant) if os.environ.get('WATCHREMOTE_DESKTOP_SHARED') == '1'
+  return (SharedAssistant(legacy_assistant) if os.environ.get('WATCHREMOTE_DESKTOP_SHARED', env.get('DESKTOP_SHARED', '0')) == '1'
           else legacy_assistant)
-
-assistant = configured_assistant()
 
 # same dir first (standalone copy), then repo root (in-repo copy)
 here = Path(__file__).resolve()
@@ -42,6 +40,7 @@ if len(TOKEN) < 16 or TOKEN == "replace-with-your-random-token":
   raise SystemExit("Set TOKEN in server/.env to a random secret of at least 16 characters")
 PORT = int(os.environ.get("WATCHREMOTE_PORT", str(urlparse(env.get("PC_BASE", "")).port or 8877)))
 BIND = os.environ.get("WATCHREMOTE_BIND", env.get("BIND", "127.0.0.1"))
+assistant = configured_assistant()
 
 def session_locked():
   # LogonUI.exe runs while lock screen shown; false positives only during

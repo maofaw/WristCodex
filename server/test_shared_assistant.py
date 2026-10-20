@@ -367,6 +367,16 @@ class SharedTests(unittest.TestCase):
             server.server_close()
             thread.join()
 
+    def test_shared_backend_persistent_opt_in_and_environment_override(self):
+        import os
+        import pc_listener
+        with patch.dict(os.environ, {}, clear=True), patch.object(pc_listener, 'env', {'DESKTOP_SHARED': '1'}):
+            self.assertIsInstance(pc_listener.configured_assistant(), SharedAssistant)
+            with patch.dict(os.environ, {'WATCHREMOTE_DESKTOP_SHARED': '0'}):
+                self.assertIs(pc_listener.configured_assistant(), pc_listener.legacy_assistant)
+        with patch.dict(os.environ, {}, clear=True), patch.object(pc_listener, 'env', {}):
+            self.assertIs(pc_listener.configured_assistant(), pc_listener.legacy_assistant)
+
     def test_unreleased_shared_backend_requires_explicit_opt_in(self):
         import os
         import pc_listener
