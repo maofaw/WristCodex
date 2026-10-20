@@ -33,6 +33,8 @@ public class AssistantActivity extends MainActivity {
   Rows adapter;
   String viewed="",draftOwner="",viewTitle="日常助手",pendingKey="",historyCursor="",listCursor="",historyStamp="";
   boolean active,listMode,attentionMode,readOnly,voiceWorking,discardCapture,loadingHistory;
+  String resumeHistoryThread="";
+  boolean historyReadOlder,historyReadAutomatic,resumeHistoryOlder,resumeHistoryAutomatic;
   String attentionStamp="";
   String attentionPage="";
   String automaticHint="";
@@ -278,7 +280,7 @@ public class AssistantActivity extends MainActivity {
   void loadHistory(boolean older,boolean automatic){
     if(listMode||isNew()||viewed.isEmpty()||loadingHistory)return;
     final String target=viewed,cursor=older?historyCursor:"";final int epoch=navigation;
-    if(older&&cursor.isEmpty())return;loadingHistory=true;
+    if(older&&cursor.isEmpty())return;loadingHistory=true;historyReadOlder=older;historyReadAutomatic=automatic;
     query(()->readRequest(url("/assistant/conversations/messages?thread_id="+enc(target)+(cursor.isEmpty()?"":"&cursor="+enc(cursor)))),epoch,data->{
       if(automatic&&!historyWindow.shouldRefresh(rows.isEmpty(),atBottom())){
         loadingHistory=false;historyStamp="";hint("新回复已完成 · 更多可返回最新消息");return;
@@ -749,8 +751,13 @@ public class AssistantActivity extends MainActivity {
   }
   @Override protected void onResume(){super.onResume();active=true;if(mic!=null&&!voiceWorking)mic.setText("点一下说话");applyState(AssistantMonitor.latest);
     if(listMode&&rows.isEmpty()){if(attentionMode)loadAttention(attentionPage);else loadConversations(listCursor);}
+    if(!listMode&&!loadingHistory&&viewed.equals(resumeHistoryThread)&&!viewed.isEmpty()&&!isNew())loadHistory(resumeHistoryOlder,resumeHistoryAutomatic);
+    resumeHistoryThread="";
   }
-  @Override protected void onPause(){active=false;navigation++;loadingHistory=false;historyStamp="";cancelRead();discardCapture=true;capture.stop();saveDraft();super.onPause();}
+  @Override protected void onPause(){
+    if(!listMode&&loadingHistory){resumeHistoryThread=viewed;resumeHistoryOlder=historyReadOlder;resumeHistoryAutomatic=historyReadAutomatic;}
+    active=false;navigation++;loadingHistory=false;historyStamp="";cancelRead();discardCapture=true;capture.stop();saveDraft();super.onPause();
+  }
   @Override protected void onStop(){
     if(Build.VERSION.SDK_INT>=27)setTurnScreenOn(false);
     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
