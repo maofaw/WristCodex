@@ -20,6 +20,7 @@ import java.util.function.Consumer;
 
 /** Standalone HTTP controller without Google services or native libraries. */
 public class MainActivity extends Activity {
+  static final int GREEN=0xFFA7F06B,INK=0xFF10150F,LINE=0xFF35462A,WHITE=0xFFE9EEE7,MUTED=0xFF929D8D;
   SharedPreferences prefs;
   LinearLayout panel;
   TextView status;
@@ -52,12 +53,12 @@ public class MainActivity extends Activity {
   }
   void button(String title, Runnable action) {
     Button b = new Button(this); b.setText(title); b.setTextSize(16); b.setAllCaps(false);
-    b.setTextColor(Color.WHITE);b.setMinHeight(dp(44));b.setMinimumHeight(dp(44));
-    b.setBackground(surface(Color.rgb(27,36,49),14));
+    b.setTextColor(GREEN);b.setMinHeight(dp(48));b.setMinimumHeight(dp(48));
+    GradientDrawable shape=surface(INK,8);shape.setStroke(dp(1),LINE);b.setBackground(shape);
     LinearLayout.LayoutParams layout=new LinearLayout.LayoutParams(-1,-2);layout.setMargins(0,dp(4),0,dp(4));
     panel.addView(b,layout); b.setOnClickListener(v -> { if (!busy) action.run(); });
     if(title.equals("Codex 任务")||title.equals("发送任务")) {
-      b.setBackground(surface(Color.rgb(42,111,234),14));b.setTypeface(null,Typeface.BOLD);
+      b.setBackground(surface(GREEN,8));b.setTextColor(Color.BLACK);b.setTypeface(null,Typeface.BOLD);
     }
   }
   void confirm(String title, Runnable action) {

@@ -73,4 +73,42 @@ class BridgeTests(unittest.TestCase):
         finally:
             server.shutdown();server.server_close();t.join()
 
+    def test_conversation_http_routes_and_target_guards(self):
+        assistant=Assistant(Path(self.tmp.name)/'conversation.json')
+        assistant.store.register('watch1','手表对话')
+        assistant.changed(thread_id='watch1',turn_id='turn1',state='running')
+        server=ThreadingHTTPServer(('127.0.0.1',0),pc_listener.Handler)
+        t=threading.Thread(target=server.serve_forever,daemon=True);t.start()
+        base='http://127.0.0.1:'+str(server.server_port)
+        def get(path,auth=True):
+            return json.loads(urlopen(base+path+('&' if '?' in path else '?')+'t='+(pc_listener.TOKEN if auth else 'wrong')).read())
+        def post(path,payload):
+            return json.loads(urlopen(Request(base+path,data=json.dumps(payload).encode(),headers={'Authorization':'Bearer '+pc_listener.TOKEN})).read())
+        def rpc(method,params):
+            if method=='thread/list':return {'data':[{'id':'pc1','name':'电脑记录'}],'nextCursor':'next'}
+            if method=='thread/read':return {'thread':{'id':params['threadId'],'name':'电脑记录'}}
+            if method=='thread/items/list':return {'data':[{'item':{'type':'agentMessage','id':'a1','text':'x'*1200}}]}
+            self.fail('unexpected RPC '+method)
+        try:
+            with patch.object(pc_listener,'assistant',assistant),patch.object(assistant.conversations,'rpc',side_effect=rpc),patch.object(assistant,'call') as call:
+                with self.assertRaises(HTTPError) as cm:get('/assistant/conversations',False)
+                self.assertEqual(cm.exception.code,403)
+                page=get('/assistant/conversations')
+                self.assertTrue(page['conversations'][0]['readonly'])
+                self.assertEqual(page['next_cursor'],'next')
+                history=get('/assistant/conversations/messages?thread_id=pc1')
+                self.assertEqual(len(history['messages'][0]['text']),180)
+                self.assertEqual(len(get('/assistant/conversations/message?thread_id=pc1&item_id=a1&page=1')['text']),200)
+                for route,payload in [('/assistant/send',dict(prompt='bad',request_id='pc-write',thread_id='pc1')),
+                    ('/assistant/stop',dict(thread_id='pc1',turn_id='turn1')),
+                    ('/assistant/answer',dict(id='missing',decision='accept',thread_id='pc1',turn_id='turn1'))]:
+                    with self.assertRaises(HTTPError) as cm:post(route,payload)
+                    self.assertEqual(cm.exception.code,409)
+                with self.assertRaises(HTTPError) as cm:get('/assistant/conversations/messages')
+                self.assertEqual(cm.exception.code,400)
+                call.assert_not_called()
+                self.assertEqual(assistant.state['thread_id'],'watch1')
+        finally:
+            server.shutdown();server.server_close();t.join()
+
 if __name__ == '__main__': unittest.main()

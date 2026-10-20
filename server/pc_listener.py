@@ -81,6 +81,19 @@ class Handler(BaseHTTPRequestHandler):
         after=int(parse_qs(url.query).get('after',['-1'])[0])
         self.reply_json(200,assistant.events(after,parse_qs(url.query).get('compact',['0'])[0]=='1'))
       except ValueError:self.reply(400,'invalid revision')
+    elif url.path.startswith('/assistant/conversations'):
+      try:
+        query=parse_qs(url.query);cursor=query.get('cursor',[None])[0]
+        if cursor is not None and len(cursor)>4096:raise ValueError('分页编号无效')
+        ident=query.get('thread_id',[''])[0]
+        if url.path=='/assistant/conversations':value=assistant.conversations.list(cursor)
+        elif url.path=='/assistant/conversations/messages':value=assistant.conversations.messages(ident,cursor)
+        elif url.path=='/assistant/conversations/message':
+          value=assistant.conversations.message(ident,query.get('item_id',[''])[0],int(query.get('page',['0'])[0]))
+        else:self.reply(404,'unknown');return
+        self.reply_json(200,value)
+      except (ValueError,UnicodeError) as exc:self.reply(400,str(exc))
+      except RuntimeError as exc:self.reply(409,str(exc))
     else:
       self.reply(404, "unknown")
 
@@ -109,13 +122,13 @@ class Handler(BaseHTTPRequestHandler):
       elif url.path == '/ai/stop':
         self.reply(200, ai_bridge.display(ai_bridge.stop()))
       elif url.path == '/assistant/send':
-        self.reply_json(202,assistant.send(payload.get('prompt'),payload.get('request_id'),payload.get('new',False)))
+        self.reply_json(202,assistant.send(payload.get('prompt'),payload.get('request_id'),payload.get('new',False),payload.get('thread_id')))
       elif url.path == '/assistant/answer':
-        self.reply_json(200,assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers')))
+        self.reply_json(200,assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers'),payload.get('thread_id'),payload.get('turn_id')))
       elif url.path == '/assistant/steer':
         self.reply_json(200,assistant.steer(payload.get('prompt'),payload.get('request_id'),payload.get('thread_id'),payload.get('turn_id')))
       elif url.path == '/assistant/stop':
-        self.reply_json(200,assistant.stop())
+        self.reply_json(200,assistant.stop(payload.get('thread_id'),payload.get('turn_id')))
       else:
         self.reply(404, 'unknown')
     except (ValueError, UnicodeError) as exc:

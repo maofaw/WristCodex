@@ -28,6 +28,7 @@ public class AssistantMonitor extends Service {
   Notification notification(boolean attention,String title,String text){
     Intent open=new Intent(this,AssistantActivity.class).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP|Intent.FLAG_ACTIVITY_SINGLE_TOP);
     open.putExtra("attention",attention);
+    open.putExtra("thread_id",latest.optString("thread_id"));
     PendingIntent pending=PendingIntent.getActivity(this,attention?3:2,open,
       PendingIntent.FLAG_UPDATE_CURRENT|PendingIntent.FLAG_IMMUTABLE);
     Notification.Builder b=new Notification.Builder(this,attention?ATTENTION:QUIET)
@@ -63,7 +64,7 @@ public class AssistantMonitor extends Service {
       wake.acquire(1000);wake.release();
       // Some watch builds ignore full-screen notifications. Try the normal activity
       // API once; Android may reject a background launch, leaving the notification.
-      try{startActivity(new Intent(this,AssistantActivity.class).putExtra("attention",true)
+      try{startActivity(new Intent(this,AssistantActivity.class).putExtra("attention",true).putExtra("thread_id",latest.optString("thread_id"))
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_CLEAR_TOP|Intent.FLAG_ACTIVITY_SINGLE_TOP));
       }catch(RuntimeException ignored){}
     }catch(SecurityException ignored){} // The notification remains if the OEM blocks waking.

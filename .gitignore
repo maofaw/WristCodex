@@ -25,4 +25,5 @@ __pycache__/
 **/models/
 **/assistant-state.json
 **/assistant-state.tmp
+**/assistant-state-conversations/
 **/voice-*.wav

@@ -10,10 +10,12 @@ import os
 import shutil
 import hashlib
 from ai_bridge import child_environment, WORKSPACE
+from conversations import ConversationStore, Conversations
 
 class Assistant:
     def __init__(self, state_file=None):
         self.file = Path(state_file or Path(__file__).with_name('assistant-state.json'))
+        self.store=ConversationStore(self.file)
         self.cv = threading.Condition(threading.RLock())
         self.write_lock = threading.Lock()
         self.start_lock = threading.Lock()
@@ -36,11 +38,17 @@ class Assistant:
             except (ValueError, OSError):
                 pass
         self.loaded = False
+        if self.state['thread_id']:
+            self.store.register(self.state['thread_id'],self.state.get('task','').split('\n')[0])
+            self.store.save(self.state)
+        self.conversations=Conversations(self)
 
     def snapshot(self, compact=False):
         with self.cv:
             value=json.loads(json.dumps(self.state))
             value.pop('supplements',None)
+            value['protocol_version']=4
+            value['title']=self.store.index.get(value['thread_id'],{}).get('title','新对话')
             reply=value.get('reply','').strip()
             value['summary']=reply[:180] if value['state'] in ('completed','failed','interrupted') else ''
             value['needs_attention']=value['state']=='failed' or bool(value['pending']) or (
@@ -57,6 +65,7 @@ class Assistant:
             tmp = self.file.with_suffix('.tmp')
             tmp.write_text(json.dumps(self.state, ensure_ascii=False), encoding='utf-8')
             tmp.replace(self.file)
+            self.store.save(self.state)
             self.cv.notify_all()
 
     def events(self, after, compact=False):
@@ -103,7 +112,7 @@ class Assistant:
                 env=child_environment(),creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
             self.loaded = False
             threading.Thread(target=self.read,args=(self.proc,),daemon=True).start()
-            self.call('initialize',dict(clientInfo=dict(name='wristcodex',title='WristCodex',version='0.3.0'),
+            self.call('initialize',dict(clientInfo=dict(name='wristcodex',title='WristCodex',version='0.4.0'),
                                       capabilities=dict(experimentalApi=True)))
             self.write(dict(method='initialized',params={}))
 
@@ -170,8 +179,13 @@ class Assistant:
             self.pending[token]=dict(rpc_id=event['id'],method=method,view=view)
             self.changed(state='waiting',message='等待你确认')
 
-    def answer(self, token, decision=None, answers=None):
+    def check_target(self,thread_id=None,turn_id=None):
+        if thread_id is not None and thread_id!=self.state['thread_id']:raise RuntimeError('对话已变化，操作未发送')
+        if turn_id is not None and turn_id!=self.state['turn_id']:raise RuntimeError('任务已变化，操作未发送')
+
+    def answer(self, token, decision=None, answers=None,thread_id=None,turn_id=None):
         with self.cv:
+            self.check_target(thread_id,turn_id)
             pending=self.pending.get(token)
             if pending is None:raise ValueError('确认已失效，请刷新')
             if pending['view']['kind']=='approval':
@@ -218,18 +232,32 @@ class Assistant:
                 if turn.get('error'):message+='：'+str(turn['error'].get('message',''))[:500]
                 self.changed(state=state,message=message)
 
-    def send(self, prompt, request_id, new=False):
+    def send(self, prompt, request_id, new=False,thread_id=None):
         if not isinstance(new,bool):raise ValueError('new 必须为布尔值')
+        if thread_id is not None and (not isinstance(thread_id,str) or len(thread_id)>200):raise ValueError('对话编号无效')
         if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>4000:raise ValueError('请输入 1–4000 字符')
         if not isinstance(request_id,str) or not request_id or len(request_id)>100:raise ValueError('请求编号无效')
+        fingerprint=hashlib.sha256(json.dumps([prompt,new,thread_id],ensure_ascii=False).encode()).hexdigest()
+        # Validate provenance outside the RPC-reader lock. Reading a PC conversation
+        # never makes it writable, and browsing never selects the execution target.
+        if thread_id and not new:self.conversations.writable(thread_id)
         with self.cv:
-            if request_id==self.state['request_id']:return self.snapshot()
+            receipt=self.store.receipt(request_id)
+            if receipt:
+                if receipt['fingerprint']!=fingerprint:raise ValueError('请求编号与原消息不一致')
+                return dict(self.snapshot(),accepted_thread_id=receipt.get('thread_id',''))
+            if request_id==self.state['request_id']:
+                return dict(self.snapshot(),accepted_thread_id=self.state['thread_id'])
             if self.state['state'] in ('starting','running','waiting'):raise RuntimeError('当前任务未结束，请先回答或停止')
-            if new:self.state['thread_id']='';self.loaded=False
+            target='' if new else (thread_id if thread_id is not None else self.state['thread_id'])
+            if target!=self.state['thread_id']:
+                self.store.save(self.state)
+                self.state['thread_id']=target;self.loaded=False
+            self.store.record(request_id,dict(fingerprint=fingerprint,thread_id=target))
             self.file_changes.clear()
             self.changed(state='starting',message='正在连接 Codex',request_id=request_id,reply='',turn_id='',task=prompt.strip()[:300],supplements={})
-        threading.Thread(target=self.start_turn,args=(prompt,),daemon=True).start()
-        return self.snapshot()
+        threading.Thread(target=self.start_turn,args=(prompt,request_id),daemon=True).start()
+        return dict(self.snapshot(),accepted_thread_id=target)
 
     def steer(self,prompt,request_id,thread_id,turn_id):
         if not isinstance(prompt,str) or not prompt.strip() or len(prompt)>4000:raise ValueError('请输入 1–4000 字符')
@@ -261,31 +289,51 @@ class Assistant:
                 receipts[request_id]['status']='accepted';self.changed()
                 return dict(self.snapshot(),supplement_accepted=True)
 
-    def start_turn(self,prompt):
+    def start_turn(self,prompt,request_id=None):
         try:
             self.ensure()
             if not self.loaded:
-                params=dict(cwd=str(WORKSPACE),approvalPolicy='on-request',approvalsReviewer='user',sandbox='workspace-write')
+                params=dict(approvalPolicy='on-request',approvalsReviewer='user',sandbox='workspace-write',excludeTurns=True)
                 thread_id=self.state['thread_id']
                 if thread_id:
                     params['threadId']=thread_id
                     result=self.call('thread/resume',params)
                 else:
+                    params.pop('excludeTurns',None)
+                    params['cwd']=str(WORKSPACE)
                     params['developerInstructions']='用简洁中文回复，适合手表阅读。沿用上下文。权限或决策需要用户确认时等待，不要自行批准。'
                     result=self.call('thread/start',params)
-                self.changed(thread_id=result['thread']['id'])
+                ident=result['thread']['id']
+                self.store.register(ident,prompt.strip().split('\n')[0])
+                if request_id:
+                    receipt=self.store.receipt(request_id)
+                    if receipt:self.store.record(request_id,dict(receipt,thread_id=ident))
+                self.changed(thread_id=ident)
                 self.loaded=True
-            self.call('turn/start',dict(threadId=self.state['thread_id'],input=[dict(type='text',text=prompt)]))
+            target=self.state['thread_id']
+            result=self.call('turn/start',dict(threadId=target,input=[dict(type='text',text=prompt)]))
             with self.cv:
-                if self.state['state'] in ('running','waiting','starting'):
-                    self.timer=threading.Timer(1200,self.stop);self.timer.daemon=True;self.timer.start()
+                if (request_id is None or self.state['request_id']==request_id) and self.state['thread_id']==target and self.state['state'] in ('running','waiting','starting'):
+                    turn=result.get('turn',{}).get('id') or self.state['turn_id']
+                    self.timer=threading.Timer(1200,self.expire,args=(request_id,target,turn));self.timer.daemon=True;self.timer.start()
         except Exception as exc:
-            self.changed(state='failed',message=str(exc)[:1000])
+            with self.cv:
+                if request_id is None or self.state['request_id']==request_id:self.changed(state='failed',message=str(exc)[:1000])
 
-    def stop(self):
-        if self.state['turn_id'] and self.state['state'] in ('running','waiting'):
-            self.call('turn/interrupt',dict(threadId=self.state['thread_id'],turnId=self.state['turn_id']))
-        elif self.state['state']=='starting':raise RuntimeError('正在连接，请稍后再停止')
+    def expire(self,request_id,thread_id,turn_id):
+        # A delayed timer from a finished conversation must never stop another one.
+        with self.cv:
+            if request_id is not None and request_id!=self.state['request_id']:return
+        try:self.stop(thread_id,turn_id)
+        except RuntimeError:pass
+
+    def stop(self,thread_id=None,turn_id=None):
+        with self.cv:
+            self.check_target(thread_id,turn_id)
+            target=self.state['thread_id'];turn=self.state['turn_id'];status=self.state['state']
+        if turn and status in ('running','waiting'):
+            self.call('turn/interrupt',dict(threadId=target,turnId=turn))
+        elif status=='starting':raise RuntimeError('正在连接，请稍后再停止')
         return self.snapshot()
 
 assistant=Assistant()
