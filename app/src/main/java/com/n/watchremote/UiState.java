@@ -3,6 +3,9 @@ package com.n.watchremote;
 /** Bounded, framework-free decisions shared by the native UI and host-JVM tests. */
 final class UiState {
   private UiState(){}
+  static boolean canSubmit(boolean shared,boolean blank,boolean running,boolean canSend,boolean canSteer){
+    return !shared||blank||(running?canSteer:canSend);
+  }
   static long retryDelay(int failures){
     if(failures<=1)return 1000;
     if(failures>=5)return 15000;

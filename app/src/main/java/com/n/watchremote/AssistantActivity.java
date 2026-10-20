@@ -149,6 +149,7 @@ public class AssistantActivity extends MainActivity {
   boolean isNew(){return viewed.startsWith(NEW);}
   boolean shared(){return connectionState.optInt("protocol_version")>=5;}
   boolean running(){String s=current.optString("state");return s.equals("starting")||s.equals("running")||s.equals("waiting");}
+  boolean canSubmit(){return UiState.canSubmit(shared(),isNew()||viewed.isEmpty(),running(),current.optBoolean("can_send"),current.optBoolean("can_steer"));}
   boolean viewingActive(){
     boolean creating=!get("followRequestId").isEmpty()&&get("followRequestId").equals(current.optString("request_id"))&&viewed.equals(get("followDraft"));
     return (!viewed.isEmpty()&&viewed.equals(current.optString("thread_id")))||creating;
@@ -223,8 +224,9 @@ public class AssistantActivity extends MainActivity {
     attentionButton.setVisibility(shared()&&count>0?View.VISIBLE:View.INVISIBLE);attentionButton.setText("待办 "+count);
     boolean blocked=!shared()&&running()&&!viewingActive();
     boolean cannotSteer=shared()&&running()&&!current.optBoolean("can_steer");
+    boolean cannotSend=!canSubmit();
     composer.setVisibility(readOnly||item!=null||blocked?View.GONE:View.VISIBLE);
-    sendButton.setEnabled(!busy&&!blocked&&!cannotSteer);sendButton.setAlpha(busy||blocked||cannotSteer?0.45f:1f);
+    sendButton.setEnabled(!busy&&!blocked&&!cannotSend);sendButton.setAlpha(busy||blocked||cannotSend?0.45f:1f);
     mic.setEnabled(!blocked);
     boolean activation=shared()&&readOnly&&!viewed.isEmpty()&&!isNew()&&connectionState.optBoolean("desktop_connected");
     boolean returnLink=!shared()&&(blocked||readOnly)&&!current.optString("thread_id").isEmpty();
@@ -233,7 +235,8 @@ public class AssistantActivity extends MainActivity {
     status.setClickable(returnLink||activation);
     String nextHint=blocked?"另一段对话正在执行 · 点此返回":activation?"点此连接电脑中的这段对话":readOnly?
       (shared()?"请先打开电脑客户端；草稿已保留":returnLink?"电脑记录只读 · 点此返回手表对话":"电脑记录当前只读"):
-      cannotSteer&&item==null?current.optString("steer_unavailable_reason","请等本轮结束后发送；草稿会保留"):"";
+      cannotSteer&&item==null?current.optString("steer_unavailable_reason","请等本轮结束后发送；草稿会保留"):
+      cannotSend&&item==null?"电脑正在同步任务状态 · 草稿已保留":"";
     if(!nextHint.isEmpty())hint(nextHint);
     else if(status.getText().toString().equals(automaticHint))hint("");
     automaticHint=nextHint;
@@ -440,6 +443,7 @@ public class AssistantActivity extends MainActivity {
     if(connectionState.optInt("protocol_version")<4){hint("请先更新电脑服务");return;}
     if(shared()&&!connectionState.optBoolean("desktop_connected")){hint("电脑客户端未连接，草稿已保留");return;}
     if(shared()&&running()&&!current.optBoolean("can_steer")){hint(current.optString("steer_unavailable_reason","请等本轮结束"));return;}
+    if(!canSubmit()){hint("电脑正在同步任务状态 · 草稿已保留");return;}
     if(running()&&!viewingActive()){hint("请等另一段对话执行结束");return;}
     if(running()&&current.optString("turn_id").isEmpty()){hint("正在建立任务，稍后可补充");return;}
     String value=prompt.getText().toString().trim();

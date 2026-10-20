@@ -29,6 +29,12 @@ public final class UiStateTest {
     check(!history.shouldRefresh(false,true),"bottom of older window is not latest history");
     history.loaded(false);
     check(history.shouldRefresh(false,true)&&!history.deferred,"explicit latest refresh resets browsing window");
+    check(!UiState.canSubmit(true,false,false,false,false),"native idle transition must keep draft without submitting");
+    check(UiState.canSubmit(true,false,false,true,false),"native ready conversation may send");
+    check(!UiState.canSubmit(true,false,true,true,false),"running conversation requires steer capability");
+    check(UiState.canSubmit(true,false,true,false,true),"steer uses its own capability");
+    check(UiState.canSubmit(true,true,false,false,false),"blank conversation has no native capability yet");
+    check(UiState.canSubmit(false,false,false,false,false),"legacy protocol remains compatible");
     System.out.println("UI protocol: identity, version, completion, bounds and backoff passed");
   }
 }
