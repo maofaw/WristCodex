@@ -8,6 +8,13 @@ final class UiState {
     if(failures>=5)return 15000;
     return 1000L<<(failures-1);
   }
+  static final class History {
+    boolean olderWindow,deferred;
+    void loaded(boolean older){olderWindow=older;deferred=false;}
+    boolean shouldRefresh(boolean empty,boolean following){
+      deferred=!empty&&(olderWindow||!following);return !deferred;
+    }
+  }
   static final class Preview {
     String threadId="",turnId="",itemId="",text="";
     long version=-1;

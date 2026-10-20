@@ -188,6 +188,7 @@ public class AssistantMonitor extends Service {
         if(!running)break;
         if(generation!=reconnectVersion||!target.equals(selectedThread)){revision=-1;continue;}
         boolean wasConnected=connected;connected=false;failures++;
+        quietState="";
         if(wasConnected||failures==1){
           getSystemService(NotificationManager.class).notify(40,notification(false,"电脑未连接","未发送的文字会保留，连接恢复后再试"));broadcast();
         }

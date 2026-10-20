@@ -42,6 +42,7 @@ public class AssistantActivity extends MainActivity {
   final ExecutorService speech=Executors.newSingleThreadExecutor();
   final ExecutorService readCanceller=Executors.newSingleThreadExecutor();
   final UiState.Preview liveReply=new UiState.Preview();
+  final UiState.History historyWindow=new UiState.History();
   volatile HttpURLConnection readConnection;
   long submittedAt,firstShownAt;
   String measuredRequest="",measuredTurn="";
@@ -95,7 +96,7 @@ public class AssistantActivity extends MainActivity {
     list=new ListView(this);list.setBackgroundColor(Color.BLACK);list.setDivider(null);
     list.setCacheColorHint(Color.BLACK);list.setScrollingCacheEnabled(false);list.setClipToPadding(true);
     list.setOnScrollListener(new AbsListView.OnScrollListener(){
-      public void onScrollStateChanged(AbsListView v,int state){dragging=state!=SCROLL_STATE_IDLE;}
+      public void onScrollStateChanged(AbsListView v,int state){dragging=state!=SCROLL_STATE_IDLE;if(!dragging&&!listMode&&historyWindow.deferred)updateChat();}
       public void onScroll(AbsListView v,int first,int count,int total){}
     });
     root.addView(list,new LinearLayout.LayoutParams(-1,0,1));
@@ -110,7 +111,7 @@ public class AssistantActivity extends MainActivity {
     AssistantMonitor.selectView(viewed);
   }
   void showChat(boolean load){
-    saveDraft();listMode=false;attentionMode=false;loadingHistory=false;pendingKey="";historyStamp="";historyCursor="";rows.clear();
+    saveDraft();historyWindow.loaded(false);listMode=false;attentionMode=false;loadingHistory=false;pendingKey="";historyStamp="";historyCursor="";rows.clear();
     if(shared()&&!viewed.equals(current.optString("thread_id")))current=new JSONObject();
     shell(viewTitle+" ▾");
     olderButton=control("加载更早消息",false,()->loadHistory(true));
@@ -239,7 +240,8 @@ public class AssistantActivity extends MainActivity {
     olderButton.setVisibility(historyCursor.isEmpty()||item!=null?View.GONE:View.VISIBLE);
     String stamp=current.optString("thread_id")+":"+current.optString("turn_id")+":"+current.optString("state");
     if(viewingActive()&&!running()&&!stamp.equals(historyStamp)&&!loadingHistory){
-      historyStamp=stamp;loadHistory(false);
+      if(historyWindow.shouldRefresh(rows.isEmpty(),atBottom())){historyStamp=stamp;loadHistory(false);}
+      else if(pendingKey.isEmpty())hint("新回复已完成 · 更多可返回最新消息");
     }
   }
   void query(Work work,int expected,Consumer<JSONObject> done){
@@ -272,6 +274,7 @@ public class AssistantActivity extends MainActivity {
     if(older&&cursor.isEmpty())return;loadingHistory=true;
     query(()->readRequest(url("/assistant/conversations/messages?thread_id="+enc(target)+(cursor.isEmpty()?"":"&cursor="+enc(cursor)))),epoch,data->{
       loadingHistory=false;JSONObject meta=data.optJSONObject("conversation");
+      historyWindow.loaded(older);
       if(meta!=null){viewTitle=meta.optString("title","对话");readOnly=meta.optBoolean("readonly",true);persistView();titleBar.setText(viewTitle+" ▾");}
       JSONArray messages=data.optJSONArray("messages");
       ArrayList<JSONObject> incoming=new ArrayList<>();if(messages!=null)for(int i=0;i<messages.length();i++)incoming.add(messages.optJSONObject(i));
@@ -369,7 +372,7 @@ public class AssistantActivity extends MainActivity {
     list.setSelectionFromTop(Math.max(0,Math.min(position,rows.size()+list.getHeaderViewsCount()-1)),offset);
   }
   void updatePreview(){
-    if(listMode||!viewingActive())return;
+    if(listMode||!viewingActive()||historyWindow.olderWindow)return;
     JSONObject preview=current.optJSONObject("reply_preview");
     if(preview==null){
       boolean removed=rows.removeIf(row->row.optBoolean("live")&&!row.optBoolean("complete"));
@@ -383,7 +386,7 @@ public class AssistantActivity extends MainActivity {
       if(row.optBoolean("live")&&!row.optBoolean("complete")&&!row.optString("id").equals(liveReply.itemId)){rows.remove(i);changed=true;}
     }
     for(int i=0;i<rows.size();i++)if(rows.get(i).optString("id").equals(liveReply.itemId)){index=i;break;}
-    if(index>=0&&!rows.get(index).optBoolean("live"))return;
+    if(index>=0&&!rows.get(index).optBoolean("live")&&liveReply.complete)return;
     try{
       JSONObject row=new JSONObject();row.put("id",liveReply.itemId);row.put("role","assistant");row.put("text",liveReply.text);
       row.put("live",true);row.put("complete",liveReply.complete);row.put("clipped",liveReply.clipped);row.put("expandable",true);
@@ -730,8 +733,10 @@ public class AssistantActivity extends MainActivity {
     super.onRequestPermissionsResult(code,permissions,results);
     if(code==7)hint(results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED?"权限已允许，点麦克风开始":"没有录音权限，可以打字");
   }
-  @Override protected void onResume(){super.onResume();active=true;if(mic!=null&&!voiceWorking)mic.setText("点一下说话");applyState(AssistantMonitor.latest);}
-  @Override protected void onPause(){active=false;discardCapture=true;capture.stop();saveDraft();super.onPause();}
+  @Override protected void onResume(){super.onResume();active=true;if(mic!=null&&!voiceWorking)mic.setText("点一下说话");applyState(AssistantMonitor.latest);
+    if(listMode&&rows.isEmpty()){if(attentionMode)loadAttention(attentionPage);else loadConversations(listCursor);}
+  }
+  @Override protected void onPause(){active=false;navigation++;loadingHistory=false;historyStamp="";cancelRead();discardCapture=true;capture.stop();saveDraft();super.onPause();}
   @Override protected void onStop(){
     if(Build.VERSION.SDK_INT>=27)setTurnScreenOn(false);
     else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);

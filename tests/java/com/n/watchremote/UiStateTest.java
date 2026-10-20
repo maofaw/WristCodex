@@ -21,6 +21,14 @@ public final class UiStateTest {
     long[] expected={1000,2000,4000,8000,15000,15000};
     for(int i=0;i<expected.length;i++)check(UiState.retryDelay(i+1)==expected[i],"backoff "+i);
     check(UiState.retryDelay(Integer.MAX_VALUE)==15000,"overflow-safe backoff");
+    UiState.History history=new UiState.History();
+    check(history.shouldRefresh(true,false),"empty history must load");
+    check(history.shouldRefresh(false,true),"following latest may reconcile completion");
+    check(!history.shouldRefresh(false,false)&&history.deferred,"reading latest page must not jump");
+    history.loaded(true);
+    check(!history.shouldRefresh(false,true),"bottom of older window is not latest history");
+    history.loaded(false);
+    check(history.shouldRefresh(false,true)&&!history.deferred,"explicit latest refresh resets browsing window");
     System.out.println("UI protocol: identity, version, completion, bounds and backoff passed");
   }
 }
