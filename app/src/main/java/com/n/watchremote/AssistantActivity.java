@@ -126,7 +126,7 @@ public class AssistantActivity extends MainActivity {
     composer=new LinearLayout(this);composer.setOrientation(LinearLayout.VERTICAL);
     prompt=new EditText(this);prompt.setTextColor(WHITE);prompt.setHintTextColor(MUTED);prompt.setTextSize(15);
     prompt.setPadding(dp(8),dp(6),dp(8),dp(6));prompt.setBackground(tile(INK,LINE));prompt.setMaxLines(3);prompt.setMinLines(1);prompt.setMinHeight(dp(48));
-    prompt.setHint("继续说点什么…");prompt.setContentDescription("当前对话的消息");
+    prompt.setHint("继续聊…");prompt.setContentDescription("当前对话的消息");
     prompt.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_FLAG_MULTI_LINE);
     String draft=get(draftKey());if(draft.isEmpty()&&!prefs.getBoolean("draftV4Migrated",false))draft=get("aiDraft");
     draftOwner=viewed;prompt.setText(draft);
@@ -136,11 +136,11 @@ public class AssistantActivity extends MainActivity {
       public void afterTextChanged(Editable e){}
     });
     composer.addView(prompt,new LinearLayout.LayoutParams(-1,-2));
-    LinearLayout inputRow=new LinearLayout(this);inputRow.setGravity(Gravity.CENTER_VERTICAL);
+    LinearLayout inputRow=new LinearLayout(this);inputRow.setGravity(Gravity.CENTER_VERTICAL);inputRow.setPadding(0,dp(6),0,0);
     mic=control("点一下说话",false,this::beginSpeech);mic.setTextSize(17);
-    LinearLayout.LayoutParams micLp=new LinearLayout.LayoutParams(0,dp(48),1);micLp.setMargins(0,dp(6),0,0);inputRow.addView(mic,micLp);
+    LinearLayout.LayoutParams micLp=new LinearLayout.LayoutParams(0,dp(48),1);inputRow.addView(mic,micLp);
     sendButton=control("发送",true,this::send);
-    LinearLayout.LayoutParams sendLp=new LinearLayout.LayoutParams(dp(76),dp(48));sendLp.setMargins(dp(8),dp(6),0,0);inputRow.addView(sendButton,sendLp);
+    LinearLayout.LayoutParams sendLp=new LinearLayout.LayoutParams(dp(76),dp(48));sendLp.setMargins(dp(8),0,0,0);inputRow.addView(sendButton,sendLp);
     composer.addView(inputRow);root.addView(composer);
     root.addView(status);status.setMaxLines(2);
     titleBar.setOnLongClickListener(v->{menu();return true;});
@@ -230,6 +230,7 @@ public class AssistantActivity extends MainActivity {
     boolean returnLink=!shared()&&(blocked||readOnly)&&!current.optString("thread_id").isEmpty();
     status.setClickable(returnLink||activation);status.setMinimumHeight(returnLink||activation?dp(48):0);status.setTextColor(returnLink||activation?GREEN:MUTED);
     status.setOnClickListener(v->{if(activation)activateViewed();else if(returnLink)returnToActive();});
+    status.setClickable(returnLink||activation);
     String nextHint=blocked?"另一段对话正在执行 · 点此返回":activation?"点此连接电脑中的这段对话":readOnly?
       (shared()?"请先打开电脑客户端；草稿已保留":returnLink?"电脑记录只读 · 点此返回手表对话":"电脑记录当前只读"):
       cannotSteer&&item==null?current.optString("steer_unavailable_reason","请等本轮结束后发送；草稿会保留"):"";
@@ -240,7 +241,7 @@ public class AssistantActivity extends MainActivity {
     olderButton.setVisibility(historyCursor.isEmpty()||item!=null?View.GONE:View.VISIBLE);
     String stamp=current.optString("thread_id")+":"+current.optString("turn_id")+":"+current.optString("state");
     if(viewingActive()&&!running()&&!stamp.equals(historyStamp)&&!loadingHistory){
-      if(historyWindow.shouldRefresh(rows.isEmpty(),atBottom())){historyStamp=stamp;loadHistory(false);}
+      if(historyWindow.shouldRefresh(rows.isEmpty(),atBottom())){historyStamp=stamp;loadHistory(false,true);}
       else if(pendingKey.isEmpty())hint("新回复已完成 · 更多可返回最新消息");
     }
   }
@@ -269,12 +270,20 @@ public class AssistantActivity extends MainActivity {
   String url(String path)throws Exception{return endpoint(path)+(path.contains("?")?"&":"?")+"t="+URLEncoder.encode(get("token"),"UTF-8");}
   String enc(String value)throws Exception{return URLEncoder.encode(value,"UTF-8");}
   void loadHistory(boolean older){
+    loadHistory(older,false);
+  }
+  void loadHistory(boolean older,boolean automatic){
     if(listMode||isNew()||viewed.isEmpty()||loadingHistory)return;
     final String target=viewed,cursor=older?historyCursor:"";final int epoch=navigation;
     if(older&&cursor.isEmpty())return;loadingHistory=true;
     query(()->readRequest(url("/assistant/conversations/messages?thread_id="+enc(target)+(cursor.isEmpty()?"":"&cursor="+enc(cursor)))),epoch,data->{
+      if(automatic&&!historyWindow.shouldRefresh(rows.isEmpty(),atBottom())){
+        loadingHistory=false;historyStamp="";hint("新回复已完成 · 更多可返回最新消息");return;
+      }
       loadingHistory=false;JSONObject meta=data.optJSONObject("conversation");
       historyWindow.loaded(older);
+      JSONObject loaded=data.optJSONObject("active");
+      if(!older&&loaded!=null)historyStamp=loaded.optString("thread_id")+":"+loaded.optString("turn_id")+":"+loaded.optString("state");
       if(meta!=null){viewTitle=meta.optString("title","对话");readOnly=meta.optBoolean("readonly",true);persistView();titleBar.setText(viewTitle+" ▾");}
       JSONArray messages=data.optJSONArray("messages");
       ArrayList<JSONObject> incoming=new ArrayList<>();if(messages!=null)for(int i=0;i<messages.length();i++)incoming.add(messages.optJSONObject(i));
@@ -292,7 +301,7 @@ public class AssistantActivity extends MainActivity {
       else if(older)list.setSelectionFromTop(Math.min(rows.size(),first+incoming.size()),offset);
       else if(!rows.isEmpty()&&(follow||empty))list.setSelection(rows.size()+list.getHeaderViewsCount()-1);
       else restoreAnchor(anchor,first,offset);
-      if(status.getText().toString().startsWith("读取失败"))hint("");
+      if(status.getText().toString().startsWith("读取失败")||(!older&&status.getText().toString().startsWith("新回复已完成")))hint("");
       if(rows.isEmpty())hint(readOnly?"暂无文字记录，可加载更早消息":"说一句，开始这段对话");
     });
   }
@@ -375,6 +384,7 @@ public class AssistantActivity extends MainActivity {
     if(listMode||!viewingActive()||historyWindow.olderWindow)return;
     JSONObject preview=current.optJSONObject("reply_preview");
     if(preview==null){
+      if(current.optBoolean("readonly"))return;
       boolean removed=rows.removeIf(row->row.optBoolean("live")&&!row.optBoolean("complete"));
       liveReply.clear();if(removed)adapter.notifyDataSetChanged();return;
     }
