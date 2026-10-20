@@ -11,7 +11,7 @@ android {
     minSdk = 26
     targetSdk = 30
     versionCode = 8
-    versionName = "0.5.0-dev"
+    versionName = "0.5.0"
   }
   // Personal sideload app intentionally targets Android 11 for watch compatibility.
   lint { disable += "ExpiredTargetSdkVersion" }

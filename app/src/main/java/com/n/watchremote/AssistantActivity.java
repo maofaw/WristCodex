@@ -452,7 +452,7 @@ public class AssistantActivity extends MainActivity {
   void menu(){
     if(voiceWorking){hint("请先结束录音并等待识别完成");return;}
     boolean reminders=connectionState.optBoolean("desktop_attention_enabled",true)&&!prefs.getBoolean("desktopLocalMute",false);
-    new AlertDialog.Builder(this).setTitle("更多操作").setItems(new String[]{"对话列表","刷新记录与连接","返回当前对话","停止当前任务","电脑控制与设置","关闭全部主动提醒","待处理（"+connectionState.optInt("attention_count")+"）","电脑确认提醒："+(reminders?"开":"关")},(d,n)->{
+    new AlertDialog.Builder(this).setTitle("更多操作").setItems(new String[]{"对话列表","刷新记录与连接","返回当前对话","停止当前任务","电脑控制与设置","关闭全部主动提醒","待处理（"+connectionState.optInt("attention_count")+"）","电脑确认提醒："+(reminders?"开":"关"),"自动弹出确认："+(android.provider.Settings.canDrawOverlays(this)?"已授权":"待授权")},(d,n)->{
       if(n==0)openList();if(n==1)refresh();if(n==2)returnToActive();
       if(n==3){
         if(!viewingActive()||!running()){hint("请先返回执行中的对话");return;}
@@ -465,7 +465,17 @@ public class AssistantActivity extends MainActivity {
       if(n==5){stopService(new Intent(this,AssistantMonitor.class));hint("提醒已关闭，下次打开助手时恢复");}
       if(n==6)openAttention("");
       if(n==7)toggleDesktopReminders(!reminders);
+      if(n==8)configureAttentionPopup();
     }).show();
+  }
+  void configureAttentionPopup(){
+    new AlertDialog.Builder(this).setTitle("自动弹出确认")
+      .setMessage("需要允许本应用“显示在其他应用上层”，才能在亮屏后打开确认卡片。只在新请求到达时打开，关闭电脑确认提醒后停止。未授权时仍可点通知处理。")
+      .setPositiveButton("打开系统授权",(d,w)->{
+        try{startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+          android.net.Uri.parse("package:"+getPackageName())));}
+        catch(ActivityNotFoundException ex){hint("系统没有授权页面，请在应用权限中允许本应用显示在其他应用上层");}
+      }).setNegativeButton("返回",null).show();
   }
   void toggleDesktopReminders(boolean enabled){
     if(!shared()){hint("请先更新电脑服务到 v0.5");return;}
@@ -473,7 +483,7 @@ public class AssistantActivity extends MainActivity {
     try{
       JSONObject body=new JSONObject();body.put("desktop_attention_enabled",enabled);
       exchange(()->request(endpoint("/assistant/preferences"),"POST",body.toString(),get("token")),state->{
-        applyState(state);hint(enabled?"电脑确认提醒已开启":"电脑确认提醒已关闭，仍可手动处理");
+        applyState(state);hint(enabled?(android.provider.Settings.canDrawOverlays(this)?"电脑确认提醒已开启":"提醒已开启；自动弹出请在更多操作中授权"):"电脑确认提醒已关闭，仍可手动处理");
       });
     }catch(Exception e){hint("设置未确认，请联网后重试");}
   }
