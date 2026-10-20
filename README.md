@@ -1,6 +1,6 @@
 # WristCodex · 腕上遥控
 
-> v0.5 候选版：电脑与手表共用本机 Codex 会话，确认提醒可关闭。正在做正式包安装回归，尚未发布新 Release。验证范围见 [v0.5 验证记录](docs/validation-v0.5.md)。
+> v0.5.0 私有试用版：电脑与手表共用本机 Codex 会话，确认提醒可关闭。OPPO Watch 4 Pro 已完成安装、原草稿保留、Tailscale 连接及正式包确认回传验收。验证范围与限制见 [v0.5 验证记录](docs/validation-v0.5.md)。
 
 将 Android 手表变成电脑 Codex 的任务遥控器。支持文字任务提交、状态及结果查询、停止任务，以及电脑状态、锁屏、睡眠、网络唤醒和自定义 HTTP 按钮。
 
