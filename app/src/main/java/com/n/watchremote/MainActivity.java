@@ -35,7 +35,9 @@ public class MainActivity extends Activity {
     super.onCreate(state); prefs = getSharedPreferences("remote", MODE_PRIVATE); initialPage();
   }
   void initialPage(){
-    if(getIntent().getBooleanExtra("controls",false))home();
+    if("connection".equals(getIntent().getStringExtra("screen")))settings();
+    else if("custom".equals(getIntent().getStringExtra("screen")))custom();
+    else if(getIntent().getBooleanExtra("controls",false))home();
     else {aiPage();finish();}
   }
   String get(String key) { return prefs.getString(key, ""); }
@@ -168,7 +170,11 @@ public class MainActivity extends Activity {
     return u;
   }
   static String request(String value,String method,String body,String bearer)throws Exception {
+    return request(value,method,body,bearer,null);
+  }
+  static String request(String value,String method,String body,String bearer,Consumer<HttpURLConnection> opened)throws Exception {
     HttpURLConnection c=(HttpURLConnection)validate(value).openConnection();
+    if(opened!=null)opened.accept(c);
     c.setInstanceFollowRedirects(false); c.setConnectTimeout(4000);
     String path=c.getURL().getPath();
     c.setReadTimeout(path.equals("/assistant/send")||path.equals("/assistant/activate")?60000:8000);

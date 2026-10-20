@@ -2,6 +2,7 @@ package com.n.watchremote;
 import android.app.*;
 import android.content.*;
 import android.os.*;
+import android.net.*;
 import org.json.*;
 import java.net.*;
 import java.io.*;
@@ -24,14 +25,23 @@ public class AssistantMonitor extends Service {
   volatile boolean running;
   volatile HttpURLConnection connection;
   Thread listener;
+  final Object retryLock=new Object();
+  volatile int reconnectVersion;
+  volatile boolean forceSnapshot;
+  ConnectivityManager.NetworkCallback networks;
+  volatile Network activeNetwork;
+  volatile boolean networkValidated;
   static void selectView(String thread){
     String target=thread.startsWith("new:")?"":thread;
     if(target.equals(selectedThread))return;selectedThread=target;
     AssistantMonitor live=instance;
-    if(live!=null){
-      final HttpURLConnection previous=live.connection;
-      if(previous!=null&&!live.canceller.isShutdown())live.canceller.execute(previous::disconnect);
-    }
+    if(live!=null)live.reconnect();
+  }
+  static void reconnectSoon(){AssistantMonitor live=instance;if(live!=null)live.reconnect();}
+  void reconnect(){
+    synchronized(retryLock){forceSnapshot=true;reconnectVersion++;retryLock.notifyAll();}
+    final HttpURLConnection previous=connection;
+    if(previous!=null&&!canceller.isShutdown())canceller.execute(previous::disconnect);
   }
   @Override public void onCreate(){super.onCreate();instance=this;
     String target=getSharedPreferences("remote",MODE_PRIVATE).getString("viewedConversation","");
@@ -42,6 +52,14 @@ public class AssistantMonitor extends Service {
     NotificationChannel alerts=new NotificationChannel(ATTENTION,"需要你处理",NotificationManager.IMPORTANCE_HIGH);
     alerts.enableVibration(true);alerts.setVibrationPattern(new long[]{0,180,100,180});alerts.setSound(null,null);
     nm.createNotificationChannel(alerts);
+    networks=new ConnectivityManager.NetworkCallback(){
+      public void onAvailable(Network network){activeNetwork=network;networkValidated=false;reconnect();}
+      public void onCapabilitiesChanged(Network network,NetworkCapabilities caps){
+        if(network.equals(activeNetwork)&&caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)&&!networkValidated){networkValidated=true;reconnect();}
+      }
+      public void onLost(Network network){if(network.equals(activeNetwork)){activeNetwork=null;networkValidated=false;reconnect();}}
+    };
+    try{getSystemService(ConnectivityManager.class).registerDefaultNetworkCallback(networks);}catch(SecurityException ignored){networks=null;}
   }
   Notification notification(boolean attention,String title,String text){
     Intent open=openIntent(attention);
@@ -125,9 +143,11 @@ public class AssistantMonitor extends Service {
   }
   void listen(){
     android.content.SharedPreferences prefs=getSharedPreferences("remote",MODE_PRIVATE);
-    long revision=-1;int failures=0;boolean hadContact=false;String outage=Long.toString(System.currentTimeMillis()),polledThread=null;
+    long revision=-1;int failures=0;boolean hadContact=false;String outage=Long.toString(System.currentTimeMillis()),polledThread=null,quietState="";
     while(running){
       final String target=selectedThread;
+      final int generation;
+      synchronized(retryLock){generation=reconnectVersion;if(forceSnapshot){revision=-1;failures=0;forceSnapshot=false;}}
       if(!target.equals(polledThread)){revision=-1;polledThread=target;}
       try{
         String base=prefs.getString("base",""),token=prefs.getString("token","");
@@ -141,6 +161,7 @@ public class AssistantMonitor extends Service {
           char[] buffer=new char[2048];int n;while((n=r.read(buffer))!=-1){if(body.length()+n>70000)throw new IOException("状态过大");body.append(buffer,0,n);}
         }
         JSONObject state=new JSONObject(body.toString());long next=state.optLong("revision",-1);
+        if(generation!=reconnectVersion||!target.equals(selectedThread))continue;
         boolean changed=!connected||revision!=next||!state.optString("thread_id").equals(latest.optString("thread_id"));
         latest=state;revision=next;connected=true;lastContact=SystemClock.elapsedRealtime();
         hadContact=true;failures=0;outage=Long.toString(System.currentTimeMillis());
@@ -156,7 +177,8 @@ public class AssistantMonitor extends Service {
             "任务需要你处理",state.optString("message"));
         }else nm.cancel(41);
         if(changed){
-          nm.notify(40,notification(false,"腕上助手 · 已连接",state.optString("message","准备接收任务")));
+          String nextQuiet=target+":"+state.optString("state")+":"+state.optString("message");
+          if(!nextQuiet.equals(quietState)){quietState=nextQuiet;nm.notify(40,notification(false,"腕上助手 · 已连接",state.optString("message","准备接收任务")));}
           broadcast();
         }
         // A completed response can race a conversation switch without throwing.
@@ -164,7 +186,7 @@ public class AssistantMonitor extends Service {
         if(!target.equals(selectedThread))revision=-1;
       }catch(Exception e){
         if(!running)break;
-        if(!target.equals(selectedThread)){revision=-1;continue;}
+        if(generation!=reconnectVersion||!target.equals(selectedThread)){revision=-1;continue;}
         boolean wasConnected=connected;connected=false;failures++;
         if(wasConnected||failures==1){
           getSystemService(NotificationManager.class).notify(40,notification(false,"电脑未连接","未发送的文字会保留，连接恢复后再试"));broadcast();
@@ -174,11 +196,15 @@ public class AssistantMonitor extends Service {
           (latest.optBoolean("desktop_attention_enabled",true)&&!prefs.getBoolean("desktopLocalMute",false));
         if(alertsAllowed&&hadContact&&failures>=3&&(status.equals("running")||status.equals("waiting")||status.equals("starting")))
           alert(prefs,"outage:"+outage,"暂时联系不上电脑","任务状态未知，请检查电脑服务和网络；不会重复发送任务");
-        try{Thread.sleep(15000);}catch(InterruptedException ignored){}
+        if(connection!=null){connection.disconnect();connection=null;}
+        synchronized(retryLock){
+          if(running&&generation==reconnectVersion)try{retryLock.wait(UiState.retryDelay(failures));}catch(InterruptedException ignored){}
+        }
       }finally{if(connection!=null){connection.disconnect();connection=null;}}
     }
   }
   @Override public void onDestroy(){running=false;connected=false;if(instance==this)instance=null;
-    if(connection!=null)connection.disconnect();if(listener!=null)listener.interrupt();canceller.shutdown();super.onDestroy();}
+    if(networks!=null)try{getSystemService(ConnectivityManager.class).unregisterNetworkCallback(networks);}catch(IllegalArgumentException ignored){}
+    reconnect();if(listener!=null)listener.interrupt();canceller.shutdown();super.onDestroy();}
   @Override public IBinder onBind(Intent i){return null;}
 }
