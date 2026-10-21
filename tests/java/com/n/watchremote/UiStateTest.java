@@ -4,6 +4,10 @@ package com.n.watchremote;
 public final class UiStateTest {
   static void check(boolean value,String message){if(!value)throw new AssertionError(message);}
   public static void main(String[] args){
+    check(" 继续验收 ".equals(UiState.answerText(" 继续验收 ")),"original option whitespace must survive submission");
+    check("  保留我的换行\n".equals(UiState.answerText("  保留我的换行\n")),"freeform answer must not be rewritten");
+    check(UiState.answerText("")==null,"empty answer must not submit");
+    check(UiState.answerText(" \t\n")==null,"blank answer must not submit");
     UiState.Preview p=new UiState.Preview();
     check(!p.update("a","t1","b","t1","m","wrong",1,false,false),"other conversation");
     check(!p.update("a","t1","a","old","m","wrong",1,false,false),"old turn");

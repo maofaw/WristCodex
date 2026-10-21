@@ -394,7 +394,7 @@ class Projection:
                         and not q.get('isSecret') and len(q['question']) <= 4000
                         and isinstance(q.get('options') or [], list) and len(q.get('options') or []) <= 10
                         and all(isinstance(o, dict) and isinstance(o.get('label'), str)
-                            and len(o['label']) <= 200 and len(str(o.get('description') or '')) <= 1000
+                            and o['label'].strip() and len(o['label']) <= 200 and len(str(o.get('description') or '')) <= 1000
                             for o in (q.get('options') or []))
                         for q in questions) and len({q['id'] for q in questions}) == len(questions):
                     view.update(kind='questions', supported=True, questions=questions,

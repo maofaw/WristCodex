@@ -158,6 +158,16 @@ class ProjectionTests(unittest.TestCase):
         question['options'] = ['not an option object']
         self.assertFalse(p.pending()[0][0]['supported'])
 
+    def test_blank_option_labels_stay_on_desktop(self):
+        for label in ['', ' \t\n']:
+            with self.subTest(label=repr(label)):
+                question = dict(id='q1', question='请选择', isOther=False,
+                    options=[dict(label='可用选项'), dict(label=label)])
+                request = dict(id=12, method='item/tool/requestUserInput', params=dict(
+                    threadId='pc1', turnId='turn1', questions=[question]))
+                p = projection(requests=[request])
+                self.assertFalse(p.pending()[0][0]['supported'])
+
 
 class SharedTests(unittest.TestCase):
     def setUp(self):
@@ -332,6 +342,17 @@ class SharedTests(unittest.TestCase):
         self.assertEqual(self.desktop.calls, [])
         self.a.answer(token, answers={'q': '原选项'}, thread_id='pc1', turn_id='turn1')
         self.assertEqual(self.desktop.calls[0][1]['response'], dict(answers={'q': dict(answers=['原选项'])}))
+
+    def test_question_response_preserves_original_option_whitespace(self):
+        q = dict(id='q', question='选哪个', isOther=False, options=[dict(label=' 继续验收 ')])
+        req = dict(id=8, method='item/tool/requestUserInput', params=dict(threadId='pc1', turnId='turn1', questions=[q]))
+        self.desktop.sessions['pc1'] = projection(requests=[req])
+        token = self.a.snapshot(True, 'pc1')['pending'][0]['id']
+        with self.assertRaises(ValueError):
+            self.a.answer(token, answers={'q': '继续验收'}, thread_id='pc1', turn_id='turn1')
+        self.assertEqual(self.desktop.calls, [])
+        self.a.answer(token, answers={'q': ' 继续验收 '}, thread_id='pc1', turn_id='turn1')
+        self.assertEqual(self.desktop.calls[0][1]['response'], dict(answers={'q': dict(answers=[' 继续验收 '])}))
 
     def test_shared_http_preferences_attention_and_target_validation(self):
         from http.server import ThreadingHTTPServer

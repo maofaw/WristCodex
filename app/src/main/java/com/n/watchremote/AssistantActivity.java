@@ -524,8 +524,8 @@ public class AssistantActivity extends MainActivity {
       }
       addControl(pendingPanel,control("提交回答",true,()->{
         JSONObject answers=new JSONObject();
-        try{for(String name:values.keySet()){String text=values.get(name).getText().toString().trim();
-          if(text.isEmpty()){hint("请回答全部问题");return;}answers.put(name,text);}
+        try{for(String name:values.keySet()){String text=UiState.answerText(values.get(name).getText().toString());
+          if(text==null){hint("请回答全部问题");return;}answers.put(name,text);}
           answer(id,null,answers,thread,turn);
         }catch(Exception e){hint("请检查回答");}
       }));
