@@ -57,7 +57,7 @@ public class AssistantActivity extends MainActivity {
     super.onCreate(state);active=true;viewed=get("viewedConversation");viewTitle=get("viewedTitle");
     if(viewTitle.isEmpty())viewTitle="日常助手";readOnly=prefs.getBoolean("viewedReadonly",false);
     registerReceiver(receiver,new IntentFilter(AssistantMonitor.UPDATE));
-    showChat(false);applyState(AssistantMonitor.latest);handleAttention(getIntent());
+    showChat(true);applyState(AssistantMonitor.latest);handleAttention(getIntent());
     startForegroundService(new Intent(this,AssistantMonitor.class));
   }
   GradientDrawable tile(int fill,int stroke){
