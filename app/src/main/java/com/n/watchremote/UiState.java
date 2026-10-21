@@ -23,9 +23,15 @@ final class UiState {
   }
   static final class Preview {
     String threadId="",turnId="",itemId="",text="";
-    long version=-1;
+    long version=-1,renderedAt;
     boolean complete,clipped;
-    void clear(){threadId="";turnId="";itemId="";text="";version=-1;complete=false;clipped=false;}
+    void rendered(long now){renderedAt=now;}
+    long renderDelay(String thread,String turn,String item,long next,boolean finished,long now){
+      boolean same=thread.equals(threadId)&&turn.equals(turnId)&&item.equals(itemId);
+      if(!same||finished||next<=version||(complete&&!finished))return 0;
+      return Math.max(0,2000-(now-renderedAt));
+    }
+    void clear(){threadId="";turnId="";itemId="";text="";version=-1;renderedAt=0;complete=false;clipped=false;}
     boolean update(String viewed,String expectedTurn,String thread,String turn,String item,
                    String body,long next,boolean finished,boolean truncated){
       if(viewed.isEmpty()||!viewed.equals(thread)||expectedTurn.isEmpty()||!expectedTurn.equals(turn)

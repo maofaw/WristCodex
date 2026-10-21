@@ -12,6 +12,14 @@ public final class UiStateTest {
     check(!p.update("a","t1","b","t1","m","wrong",1,false,false),"other conversation");
     check(!p.update("a","t1","a","old","m","wrong",1,false,false),"old turn");
     check(p.update("a","t1","a","t1","m","first",1,false,false),"first output");
+    p.rendered(1000);
+    check(p.renderDelay("a","t1","m",2,false,1500)==1500,"middle updates share a fixed two-second paint deadline");
+    check(p.version==1&&p.text.equals("first"),"deferring paint must not consume the incoming version");
+    check(p.renderDelay("a","t1","m",3,false,2500)==500,"newer bodies must not postpone the original deadline");
+    check(p.renderDelay("a","t1","m",3,false,3000)==0,"latest body may paint when the deadline arrives");
+    check(p.renderDelay("a","t1","m",2,true,1001)==0,"completion must bypass the paint deadline");
+    check(p.renderDelay("a","t2","new",1,false,1001)==0,"a different turn first body must be immediate");
+    check(p.renderDelay("a","t1","m",1,false,1001)==0,"duplicate snapshots must not schedule another repaint");
     check(!p.update("a","t1","a","t1","m","stale",0,false,false),"old version");
     check(!p.update("a","t1","a","t1","m","duplicate",1,false,false),"duplicate version");
     check(p.update("a","t1","a","t1","m","finished",2,true,false),"completion");

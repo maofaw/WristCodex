@@ -51,6 +51,7 @@ public class AssistantActivity extends MainActivity {
   boolean dragging;
   VoiceCapture capture=new VoiceCapture();
   Runnable saveDraft=()->saveDraft();
+  Runnable showLatestPreview=()->{if(active&&!isDestroyed())updatePreview();};
   BroadcastReceiver receiver=new BroadcastReceiver(){public void onReceive(Context c,Intent i){applyState(AssistantMonitor.latest);}};
   @Override void initialPage(){}
   @Override public void onCreate(Bundle state){
@@ -78,7 +79,7 @@ public class AssistantActivity extends MainActivity {
     t.setPadding(dp(4),dp(4),dp(4),dp(4));return t;
   }
   void shell(String title){
-    navigation++;liveReply.clear();cancelRead();root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);
+    navigation++;ui.removeCallbacks(showLatestPreview);liveReply.clear();cancelRead();root=new LinearLayout(this);root.setOrientation(LinearLayout.VERTICAL);
     root.setPadding(dp(12),dp(8),dp(12),dp(8));root.setBackgroundColor(Color.BLACK);setContentView(root);
     root.setFocusableInTouchMode(true);root.requestFocus();
     titleBar=control(title,false,()->{if(listMode)showChat(true);else openList();});
@@ -386,13 +387,19 @@ public class AssistantActivity extends MainActivity {
     list.setSelectionFromTop(Math.max(0,Math.min(position,rows.size()+list.getHeaderViewsCount()-1)),offset);
   }
   void updatePreview(){
-    if(listMode||!viewingActive()||historyWindow.olderWindow)return;
+    if(!active||listMode||!viewingActive()||historyWindow.olderWindow)return;
     JSONObject preview=current.optJSONObject("reply_preview");
     if(preview==null){
+      ui.removeCallbacks(showLatestPreview);
       if(current.optBoolean("readonly"))return;
       boolean removed=rows.removeIf(row->row.optBoolean("live")&&!row.optBoolean("complete"));
       liveReply.clear();if(removed)adapter.notifyDataSetChanged();return;
     }
+    long now=SystemClock.elapsedRealtime();
+    long delay=liveReply.renderDelay(preview.optString("thread_id"),preview.optString("turn_id"),
+      preview.optString("item_id"),preview.optLong("version",-1),preview.optBoolean("complete"),now);
+    if(delay>0){ui.removeCallbacks(showLatestPreview);ui.postDelayed(showLatestPreview,delay);return;}
+    ui.removeCallbacks(showLatestPreview);
     if(!liveReply.update(viewed,current.optString("turn_id"),preview.optString("thread_id"),preview.optString("turn_id"),
         preview.optString("item_id"),preview.optString("text"),preview.optLong("version",-1),preview.optBoolean("complete"),preview.optBoolean("clipped")))return;
     boolean follow=atBottom();int first=list.getFirstVisiblePosition();View child=list.getChildAt(0);int offset=child==null?0:child.getTop();String anchor=anchorId();
@@ -412,6 +419,7 @@ public class AssistantActivity extends MainActivity {
       }
       if(follow&&changed)list.setSelection(rows.size()+list.getHeaderViewsCount()-1);
       else if(changed)restoreAnchor(anchor,first,offset);
+      liveReply.rendered(now);
       if(!measuredRequest.isEmpty()&&current.optString("request_id").equals(measuredRequest)){
         if(firstShownAt==0){firstShownAt=SystemClock.elapsedRealtime();android.util.Log.i("WristCodexTiming","request="+measuredRequest+" first_display_ms="+(firstShownAt-submittedAt));}
         if(liveReply.complete&&!measuredTurn.equals(liveReply.turnId)){measuredTurn=liveReply.turnId;android.util.Log.i("WristCodexTiming","request="+measuredRequest+" complete_display_ms="+(SystemClock.elapsedRealtime()-submittedAt));}
@@ -756,7 +764,7 @@ public class AssistantActivity extends MainActivity {
   }
   @Override protected void onPause(){
     if(!listMode&&loadingHistory){resumeHistoryThread=viewed;resumeHistoryOlder=historyReadOlder;resumeHistoryAutomatic=historyReadAutomatic;}
-    active=false;navigation++;loadingHistory=false;historyStamp="";cancelRead();discardCapture=true;capture.stop();saveDraft();super.onPause();
+    active=false;ui.removeCallbacks(showLatestPreview);navigation++;loadingHistory=false;historyStamp="";cancelRead();discardCapture=true;capture.stop();saveDraft();super.onPause();
   }
   @Override protected void onStop(){
     if(Build.VERSION.SDK_INT>=27)setTurnScreenOn(false);
