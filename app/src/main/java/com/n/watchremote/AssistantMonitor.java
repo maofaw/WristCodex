@@ -95,17 +95,18 @@ public class AssistantMonitor extends Service {
   @SuppressWarnings("deprecation")
   void wakeOnce(){
     PowerManager power=getSystemService(PowerManager.class);
-    if(power.isInteractive())return;
     // Wake only for a new actionable event. Release immediately: the system timeout wins.
-    try{
-      PowerManager.WakeLock wake=power.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK|
-        PowerManager.ACQUIRE_CAUSES_WAKEUP|PowerManager.ON_AFTER_RELEASE,"WristCodex:attention");
-      wake.acquire(1000);wake.release();
-      // Some watch builds ignore full-screen notifications. Try the normal activity
-      // API once; Android may reject a background launch, leaving the notification.
-      try{startActivity(openIntent(true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
-      }catch(RuntimeException ignored){}
-    }catch(SecurityException ignored){} // The notification remains if the OEM blocks waking.
+    if(!power.isInteractive()){
+      try{
+        PowerManager.WakeLock wake=power.newWakeLock(PowerManager.SCREEN_BRIGHT_WAKE_LOCK|
+          PowerManager.ACQUIRE_CAUSES_WAKEUP|PowerManager.ON_AFTER_RELEASE,"WristCodex:attention");
+        wake.acquire(1000);wake.release();
+      }catch(SecurityException ignored){} // The notification remains if the OEM blocks waking.
+    }
+    // Some watch builds ignore full-screen notifications, including while awake.
+    // Try once independently of waking; a rejected launch leaves the notification.
+    try{startActivity(openIntent(true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+    }catch(RuntimeException ignored){}
   }
   void desktopAlerts(JSONObject state,android.content.SharedPreferences prefs){
     NotificationManager nm=getSystemService(NotificationManager.class);
