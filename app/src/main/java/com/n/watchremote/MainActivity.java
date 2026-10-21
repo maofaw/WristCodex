@@ -64,8 +64,28 @@ public class MainActivity extends Activity {
     }
   }
   void confirm(String title, Runnable action) {
-    new AlertDialog.Builder(this).setMessage(title).setPositiveButton("执行",(d,w)->action.run())
-      .setNegativeButton("取消",null).show();
+    showDialog(new AlertDialog.Builder(this).setMessage(title).setPositiveButton("执行",(d,w)->action.run())
+      .setNegativeButton("取消",null).create());
+  }
+  // OEM dialog themes can fix action buttons below the minimum touch size.
+  AlertDialog showDialog(AlertDialog dialog) {
+    dialog.show();
+    int minimum=dp(48);
+    for(int action:new int[]{AlertDialog.BUTTON_POSITIVE,AlertDialog.BUTTON_NEGATIVE,AlertDialog.BUTTON_NEUTRAL}) {
+      Button button=dialog.getButton(action);if(button==null)continue;
+      button.setMinHeight(Math.max(button.getMinHeight(),minimum));
+      button.setMinimumHeight(Math.max(button.getMinimumHeight(),minimum));
+      button.setMinWidth(Math.max(button.getMinWidth(),minimum));
+      button.setMinimumWidth(Math.max(button.getMinimumWidth(),minimum));
+      android.view.ViewGroup.LayoutParams layout=button.getLayoutParams();
+      if(layout!=null) {
+        boolean resized=false;
+        if(layout.height>=0&&layout.height<minimum){layout.height=minimum;resized=true;}
+        if(layout.width>=0&&layout.width<minimum){layout.width=minimum;resized=true;}
+        if(resized)button.setLayoutParams(layout);
+      }
+    }
+    return dialog;
   }
   void home() {
     atHome = true; page("腕上遥控");

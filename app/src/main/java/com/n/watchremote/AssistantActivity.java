@@ -556,7 +556,7 @@ public class AssistantActivity extends MainActivity {
   }
   void menu(){
     if(voiceWorking){hint("请先结束录音并等待识别完成");return;}
-    new AlertDialog.Builder(this).setTitle("更多操作").setItems(new String[]{"刷新连接与记录","返回执行中的对话","停止当前任务","电脑控制","设置与提醒"},(d,n)->{
+    showDialog(new AlertDialog.Builder(this).setTitle("更多操作").setItems(new String[]{"刷新连接与记录","返回执行中的对话","停止当前任务","电脑控制","设置与提醒"},(d,n)->{
       if(n==0)refresh();if(n==1)returnToActive();
       if(n==2){
         if(!viewingActive()||!running()){hint("请先返回执行中的对话");return;}
@@ -567,26 +567,26 @@ public class AssistantActivity extends MainActivity {
       }
       if(n==3)startActivity(new Intent(this,MainActivity.class).putExtra("controls",true));
       if(n==4)reminderSettings();
-    }).show();
+    }).create());
   }
   void reminderSettings(){
     boolean reminders=connectionState.optBoolean("desktop_attention_enabled",true)&&!prefs.getBoolean("desktopLocalMute",false);
-    new AlertDialog.Builder(this).setTitle("设置与提醒").setItems(new String[]{
+    showDialog(new AlertDialog.Builder(this).setTitle("设置与提醒").setItems(new String[]{
       "电脑确认提醒："+(reminders?"开":"关"),"自动弹出确认："+(android.provider.Settings.canDrawOverlays(this)?"已授权":"待授权"),
       "暂停全部主动提醒","连接设置","自定义接口"},(d,n)->{
       if(n==0)toggleDesktopReminders(!reminders);if(n==1)configureAttentionPopup();
       if(n==2){stopService(new Intent(this,AssistantMonitor.class));hint("提醒已暂停，下次打开助手时恢复");}
       if(n==3||n==4)startActivity(new Intent(this,MainActivity.class).putExtra("screen",n==3?"connection":"custom"));
-    }).show();
+    }).create());
   }
   void configureAttentionPopup(){
-    new AlertDialog.Builder(this).setTitle("自动弹出确认")
+    showDialog(new AlertDialog.Builder(this).setTitle("自动弹出确认")
       .setMessage("需要允许本应用“显示在其他应用上层”，才能在亮屏后打开确认卡片。只在新请求到达时打开，关闭电脑确认提醒后停止。未授权时仍可点通知处理。")
       .setPositiveButton("打开系统授权",(d,w)->{
         try{startActivity(new Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
           android.net.Uri.parse("package:"+getPackageName())));}
         catch(ActivityNotFoundException ex){hint("系统没有授权页面，请在应用权限中允许本应用显示在其他应用上层");}
-      }).setNegativeButton("返回",null).show();
+      }).setNegativeButton("返回",null).create());
   }
   void toggleDesktopReminders(boolean enabled){
     if(!shared()){hint("请先更新电脑服务到 v0.5");return;}
@@ -647,7 +647,7 @@ public class AssistantActivity extends MainActivity {
     };
     TextView text=label("正在读取…",15);text.setTextIsSelectable(true);box.addView(text);
     AlertDialog dialog=new AlertDialog.Builder(this).setTitle("消息").setView(box)
-      .setPositiveButton("关闭",null).setNegativeButton("上一页",null).setNeutralButton("下一页",null).create();dialog.show();
+      .setPositiveButton("关闭",null).setNegativeButton("上一页",null).setNeutralButton("下一页",null).create();showDialog(dialog);
     Runnable fetch=()->{
       dialog.getButton(-2).setEnabled(false);dialog.getButton(-3).setEnabled(false);int selected=page[0];
       query(()->readRequest(url("/assistant/conversations/message?thread_id="+enc(thread)+"&item_id="+enc(item)+"&page="+selected)),epoch,data->{
@@ -671,7 +671,7 @@ public class AssistantActivity extends MainActivity {
     text.setTextSize(16);text.setTextColor(Color.WHITE);text.setTextIsSelectable(true);text.setPadding(dp(12),dp(8),dp(12),dp(8));container.addView(text);
     AlertDialog dialog=new AlertDialog.Builder(this).setTitle(title).setView(container)
       .setPositiveButton("关闭",null).setNegativeButton("上一页",null).setNeutralButton("下一页",null).create();
-    dialog.show();
+    showDialog(dialog);
     Runnable update=()->{
       int start=index[0]*size,end=Math.min(value.length(),start+size);
       // Keep UTF-16 surrogate pairs together at page boundaries.
@@ -705,9 +705,9 @@ public class AssistantActivity extends MainActivity {
         if(!active||discardCapture||!speechTarget.equals(viewed))return;
         if(result==null){hint("语音识别未成功，请重试；草稿已保留");return;}
         if(!prompt.getText().toString().trim().isEmpty()){
-          new AlertDialog.Builder(this).setMessage("用识别文字替换当前草稿？")
+          showDialog(new AlertDialog.Builder(this).setMessage("用识别文字替换当前草稿？")
             .setPositiveButton("替换",(d,w)->prompt.setText(result.optString("text")))
-            .setNegativeButton("保留草稿",null).show();
+            .setNegativeButton("保留草稿",null).create());
         }else prompt.setText(result.optString("text"));
         hint("已识别，请检查文字再发送");
         });
