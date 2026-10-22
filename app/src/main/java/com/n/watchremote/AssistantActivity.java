@@ -77,6 +77,11 @@ public class AssistantActivity extends MainActivity {
   void addControl(LinearLayout parent,Button b){
     LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(-1,-2);lp.setMargins(0,dp(4),0,dp(4));parent.addView(b,lp);
   }
+  LinearLayout buttonContainer(Button button){
+    // ListView disables nonselectable header/footer roots. Keep actions as children.
+    LinearLayout container=new LinearLayout(this);container.addView(button,new LinearLayout.LayoutParams(-1,-2));return container;
+  }
+  void addButtonHeader(Button button){list.addHeaderView(buttonContainer(button),null,false);}
   TextView label(String value,int size){
     TextView t=new TextView(this);t.setText(value);t.setTextSize(size);t.setTextColor(WHITE);
     t.setPadding(dp(4),dp(4),dp(4),dp(4));return t;
@@ -346,7 +351,7 @@ public class AssistantActivity extends MainActivity {
     saveDraft();prompt=null;listMode=true;attentionMode=false;loadingHistory=false;rows.clear();listCursor="";
     shell(archived?"已归档对话":"对话列表");
     Button create=control(archived?"返回最近对话":"＋ 新建对话",false,archived?this::openList:this::newConversation);
-    list.addHeaderView(create,null,false);
+    addButtonHeader(create);
     LinearLayout footer=new LinearLayout(this);footer.setOrientation(LinearLayout.VERTICAL);
     LinearLayout pageRow=new LinearLayout(this);pageRow.setOrientation(LinearLayout.HORIZONTAL);
     listPrevious=control("上一页",false,()->flipConversations(-1));listMore=control("下一页",false,()->flipConversations(1));
@@ -920,9 +925,9 @@ public class AssistantActivity extends MainActivity {
     if(voiceWorking){hint("请先结束录音");return;}
     saveDraft();prompt=null;listMode=true;attentionMode=true;rows.clear();listCursor=cursor;
     shell("待处理");attentionButton.setVisibility(View.GONE);
-    list.addHeaderView(control("刷新待处理",false,()->loadAttention("")),null,false);
+    addButtonHeader(control("刷新待处理",false,()->loadAttention("")));
     listMore=control("加载更多",false,()->{if(!listCursor.isEmpty())loadAttention(listCursor);});
-    list.addFooterView(listMore,null,false);adapter=new Rows();list.setAdapter(adapter);
+    list.addFooterView(buttonContainer(listMore),null,false);adapter=new Rows();list.setAdapter(adapter);
     list.setOnItemClickListener((p,v,pos,id)->{
       int at=pos-list.getHeaderViewsCount();if(at<0||at>=rows.size())return;
       JSONObject item=rows.get(at);viewed=item.optString("thread_id");viewTitle=item.optString("title");readOnly=false;

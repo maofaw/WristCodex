@@ -231,6 +231,7 @@ class SharedAssistant(ThreadManagement):
     def attention(self, cursor=0):
         if not isinstance(cursor, int) or cursor < 0:
             raise ValueError('待处理页码无效')
+        self.refresh_verification()
         rows = []
         keys = []
         if self.desktop.connected:
@@ -241,9 +242,11 @@ class SharedAssistant(ThreadManagement):
                     pending = state.pending()
                     keys.extend(v['id'] for v, _ in pending)
                     if pending:
-                        first = pending[0][0]
-                        rows.append({k: first[k] for k in ('id', 'thread_id', 'turn_id', 'title', 'summary', 'supported')}
-                            | dict(count=len(pending)))
+                        first = self.decision_status(pending[0][0])
+                        modern = first['kind'] not in ('questions','approval','manual') or first.get('source') == 'async_questions' or any(
+                            str(o.get('value','')).startswith('option:') for o in first.get('decisions',[]) if isinstance(o,dict))
+                        rows.append({k: first[k] for k in ('id', 'thread_id', 'turn_id', 'title', 'summary', 'supported','kind','version','source')}
+                            | dict(count=len(pending), unavailable_reason=first.get('unavailable_reason',''), requires_protocol=6 if modern else 5))
         rows.sort(key=lambda r: (r['title'], r['thread_id']))
         return dict(items=rows[cursor:cursor + 20], keys=keys[:128], total=sum(r['count'] for r in rows),
             conversations=len(rows), next_cursor=cursor + 20 if cursor + 20 < len(rows) else None)
@@ -322,9 +325,12 @@ class SharedAssistant(ThreadManagement):
         if protocol >= 6:
             return value
         result = copy.deepcopy(value)
-        for item in result.get('pending', []):
+        items = result.get('pending', [])
+        if 'total' in result and isinstance(result.get('keys'),list):
+            items = items + result.get('items',[])
+        for item in items:
             structured_rules = any(str(o.get('value','')).startswith('option:') for o in item.get('decisions',[]) if isinstance(o,dict))
-            if not item.get('supported') or item.get('kind') not in ('questions', 'approval', 'manual') or item.get('source') == 'async_questions' or structured_rules:
+            if not item.get('supported') or item.get('kind') not in ('questions', 'approval', 'manual') or item.get('source') == 'async_questions' or structured_rules or item.get('requires_protocol') == 6:
                 reason = item.get('unavailable_reason') or '此请求需要新版手表，请在电脑处理'
                 for key in ('questions', 'permissions', 'fields', 'decisions'):
                     item.pop(key, None)

@@ -207,6 +207,17 @@ class DecisionAnswerTests(unittest.TestCase):
         self.assertEqual(legacy['pending'][0]['kind'], 'manual')
         self.assertNotIn('permissions', legacy['pending'][0])
 
+    def test_attention_list_reports_actual_capability_version_and_old_client_fallback(self):
+        view=self.pending(request('item/permissions/requestApproval',permissions=dict(network=dict(enabled=True))))
+        first=self.a.attention()['items'][0]
+        self.assertFalse(first['supported'])
+        self.assertEqual(first['version'],view['version'])
+        self.assertIn('验证',first['unavailable_reason'])
+        self.a.verified_capabilities.add('permissions')
+        current=self.a.attention()
+        self.assertTrue(current['items'][0]['supported'])
+        self.assertEqual(self.a.client_snapshot(current,5)['items'][0]['kind'],'manual')
+
     def test_reconnected_client_cannot_reuse_evidence_from_an_old_build(self):
         self.desktop.connection_generation=1
         with patch('shared_assistant.verified_actions',return_value={'permissions'}):
