@@ -1,5 +1,28 @@
 # WristCodex · 腕上遥控
 
+## 安装包与版本选择
+
+所有历史安装包已归档到 [Releases 下载区](https://github.com/maofaw/WristCodex/releases)。各版本均为侧载测试版；0.6.0-rc1 是候选版，部分决策入口仍需回电脑处理。
+
+| 版本 | 下载与说明 | 配套源码 |
+|---|---|---|
+| 0.6.0-rc1 候选版 | [APK、功能边界与校验值](https://github.com/maofaw/WristCodex/releases/tag/v0.6.0-rc1) | [0.6.0-rc1](https://github.com/maofaw/WristCodex/tree/v0.6.0-rc1) |
+| 0.5.1（含早期版） | [APK 与早期包](https://github.com/maofaw/WristCodex/releases/tag/v0.5.1) | [0.5.1](https://github.com/maofaw/WristCodex/tree/v0.5.1) |
+| 0.5.0 | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.5.0) | [0.5.0](https://github.com/maofaw/WristCodex/tree/v0.5.0) |
+| 0.4.0（含 QA 包） | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.4.0) | [0.4.0](https://github.com/maofaw/WristCodex/tree/v0.4.0) |
+| 0.3.0（含 QA 包） | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.3.0) | [0.3.0](https://github.com/maofaw/WristCodex/tree/v0.3.0) |
+| 0.2.0 | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.2.0) | [0.2.0](https://github.com/maofaw/WristCodex/tree/v0.2.0) |
+| 0.1.0（含最初 OPPO 界面原型） | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.1.0) | [0.1.0](https://github.com/maofaw/WristCodex/tree/v0.1.0) |
+
+**手表 APK 与电脑服务应使用同一版本。** 本页下方及 `main` 的服务源码仍对应 0.4 兼容模式；使用 0.5/0.6 时请打开表中的配套源码和说明。候选版持续开发在 [codex/decision-management](https://github.com/maofaw/WristCodex/tree/codex/decision-management)，没有把未完成特性合并到主分支。
+
+QA 包使用独立包名，可与主应用共存；早期版和后续 0.5.1 是不同二进制。每页附 `SHA256SUMS.txt`，历史包保留原测试签名且未重新打包。低版本可能无法直接覆盖降级，卸载会删除应用本地配置和草稿。
+
+仓库使用 MIT 许可证，保留原作者署名。个人连接口令、会话状态、模型缓存、录音及签名私钥不随源码或安装包分发；请自行配置电脑服务。
+
+---
+
+
 将 Android 手表变成电脑 Codex 的任务遥控器。支持文字任务提交、状态及结果查询、停止任务，以及电脑状态、锁屏、睡眠、网络唤醒和自定义 HTTP 按钮。
 
 ## 验证设备
