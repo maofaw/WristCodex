@@ -243,8 +243,10 @@ class SharedAssistant(ThreadManagement):
                     keys.extend(v['id'] for v, _ in pending)
                     if pending:
                         first = self.decision_status(pending[0][0])
-                        modern = first['kind'] not in ('questions','approval','manual') or first.get('source') == 'async_questions' or any(
-                            str(o.get('value','')).startswith('option:') for o in first.get('decisions',[]) if isinstance(o,dict))
+                        plain_approval = first['kind']=='approval' and any(o.get('value') in ('accept','decline','cancel')
+                            and o.get('supported',True) for o in first.get('decisions',[]) if isinstance(o,dict))
+                        modern = first['kind'] not in ('questions','approval','manual') or first.get('source') == 'async_questions' or (
+                            first['kind']=='approval' and not plain_approval)
                         rows.append({k: first[k] for k in ('id', 'thread_id', 'turn_id', 'title', 'summary', 'supported','kind','version','source')}
                             | dict(count=len(pending), unavailable_reason=first.get('unavailable_reason',''), requires_protocol=6 if modern else 5))
         rows.sort(key=lambda r: (r['title'], r['thread_id']))
@@ -296,7 +298,7 @@ class SharedAssistant(ThreadManagement):
         self.refresh_verification()
         connected = self.desktop.connected
         result = {}
-        for name in ('permissions', 'forms', 'async_questions', 'plan_execute', 'plan_modify',
+        for name in ('permissions', 'forms', 'approval_extensions', 'async_questions', 'plan_execute', 'plan_modify',
                 'settings', 'rename', 'archive', 'restore'):
             available = connected and name in self.verified_capabilities
             # No atomic native plan action or bound async response exists in the
@@ -310,6 +312,12 @@ class SharedAssistant(ThreadManagement):
     def decision_status(self, view):
         self.refresh_verification()
         value = copy.deepcopy(view)
+        if value.get('kind') == 'approval':
+            for option in value.get('decisions',[]):
+                if option['value'] not in ('accept','decline','cancel') and 'approval_extensions' not in self.verified_capabilities:
+                    option.update(supported=False, unavailable_reason='此授权范围尚未通过本机验证，请在电脑处理')
+            if not any(o.get('supported',True) for o in value.get('decisions',[])):
+                value.update(supported=False, unavailable_reason='这些授权范围尚未通过本机验证，请在电脑处理')
         feature = {'permissions': 'permissions', 'form': 'forms'}.get(value.get('kind'))
         if feature and feature not in self.verified_capabilities:
             value.update(supported=False, unavailable_reason='本机此类确认接口尚未通过验证，请在电脑处理')
@@ -318,6 +326,8 @@ class SharedAssistant(ThreadManagement):
         if old and old.get('status') in ('sending', 'unknown', 'accepted'):
             value.update(supported=False, unavailable_reason='此回答已提交或送达未知，请刷新确认，不会重复发送',
                 delivery_status=old['status'])
+        value['availability_version'] = digest([value.get('supported'),
+            [(o.get('value'),o.get('supported',True)) for o in value.get('decisions',[])]])
         return value
 
     @staticmethod
@@ -329,6 +339,14 @@ class SharedAssistant(ThreadManagement):
         if 'total' in result and isinstance(result.get('keys'),list):
             items = items + result.get('items',[])
         for item in items:
+            if item.get('kind') == 'approval' and isinstance(item.get('decisions'),list):
+                original=item['decisions']
+                item['decisions']=[o for o in original if o.get('value') in ('accept','decline','cancel') and o.get('supported',True)]
+                if len(original)!=len(item['decisions']):
+                    if item['decisions']:
+                        item['detail']=item.get('detail','')+'\n\n其他授权范围请在电脑处理。'
+                    else:
+                        item.update(supported=False,unavailable_reason='此请求的授权范围需要新版手表或电脑处理')
             structured_rules = any(str(o.get('value','')).startswith('option:') for o in item.get('decisions',[]) if isinstance(o,dict))
             if not item.get('supported') or item.get('kind') not in ('questions', 'approval', 'manual') or item.get('source') == 'async_questions' or structured_rules or item.get('requires_protocol') == 6:
                 reason = item.get('unavailable_reason') or '此请求需要新版手表，请在电脑处理'
@@ -543,7 +561,7 @@ class SharedAssistant(ThreadManagement):
     def answer(self, token, decision=None, answers=None, thread_id=None, turn_id=None, expected_version=None, response=None):
         with self.operation_lock:
             owner, _, (view, raw) = self.target(thread_id, turn_id, token)
-            new_kind = view['kind'] not in ('questions', 'approval', 'manual') or view.get('source') == 'async_questions' or isinstance(decision,str) and decision.startswith('option:')
+            new_kind = view['kind'] not in ('questions', 'approval', 'manual') or view.get('source') == 'async_questions' or isinstance(decision,str) and (decision.startswith('option:') or decision=='acceptForSession')
             if ((expected_version is not None and expected_version != view.get('version'))
                     or new_kind and not expected_version):
                 raise ValueError('请求内容已变化或缺少操作版本，请刷新后决定')
@@ -561,6 +579,9 @@ class SharedAssistant(ThreadManagement):
             if view['kind'] == 'approval':
                 if decision not in [o['value'] for o in view['decisions']]:
                     raise ValueError('此确认选项不适用')
+                choice=next(o for o in view['decisions'] if o['value']==decision)
+                if not choice.get('supported',True):
+                    raise DesktopUnavailable(choice['unavailable_reason'])
                 params['decision'] = decision
                 if decision.startswith('option:'):
                     params['decision'] = next((o for o in raw['params'].get('availableDecisions', [])

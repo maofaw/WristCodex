@@ -175,6 +175,7 @@ class DecisionAnswerTests(unittest.TestCase):
         return self.a.snapshot(True, 'pc1')['pending'][0]
 
     def test_policy_amendments_are_manual_for_clients_that_cannot_show_rule_details(self):
+        self.a.verified_capabilities.add('approval_extensions')
         value=command();value['params']['availableDecisions']=[dict(applyNetworkPolicyAmendment=dict(network_policy_amendment=dict(host='example.test',action='allow')))]
         view=self.pending(value)
         modern=self.a.client_snapshot(self.a.snapshot(True,'pc1'),6)['pending'][0]
@@ -184,6 +185,43 @@ class DecisionAnswerTests(unittest.TestCase):
         self.assertNotIn('decisions',old)
         with self.assertRaises(ValueError):
             self.a.answer(view['id'],view['decisions'][0]['value'],thread_id='pc1',turn_id='turn1')
+
+    def test_unverified_expanded_approval_keeps_once_only_but_cannot_grant_more(self):
+        from desktop_ipc import DesktopUnavailable
+        value=command();value['params']['availableDecisions']=['accept','acceptForSession',dict(applyNetworkPolicyAmendment=dict(network_policy_amendment=dict(host='example.test',action='allow'))),'decline']
+        view=self.pending(value)
+        choices=view['decisions'];self.assertTrue(view['supported'])
+        for choice in choices:
+            if choice['value'] in ('accept','decline'):continue
+            self.assertFalse(choice['supported'])
+            with self.assertRaises(DesktopUnavailable):
+                self.a.answer(view['id'],choice['value'],thread_id='pc1',turn_id='turn1',expected_version=view['version'])
+        self.assertEqual(self.desktop.calls,[])
+        old=self.a.client_snapshot(self.a.snapshot(True,'pc1'),5)['pending'][0]
+        self.assertTrue(old['supported'])
+        self.assertEqual([o['value'] for o in old['decisions']],['accept','decline'])
+        row=self.a.client_snapshot(self.a.attention(),5)['items'][0]
+        self.assertTrue(row['supported'])
+        self.a.answer(view['id'],'accept',thread_id='pc1',turn_id='turn1',expected_version=view['version'])
+        self.assertEqual(self.desktop.calls[-1][1]['decision'],'accept')
+
+    def test_verified_session_choice_still_requires_current_operation_version(self):
+        self.a.verified_capabilities.add('approval_extensions')
+        value=command();value['params']['availableDecisions']=['acceptForSession','decline']
+        view=self.pending(value)
+        with self.assertRaises(ValueError):
+            self.a.answer(view['id'],'acceptForSession',thread_id='pc1',turn_id='turn1')
+        self.a.answer(view['id'],'acceptForSession',thread_id='pc1',turn_id='turn1',expected_version=view['version'])
+        self.assertEqual(self.desktop.calls[-1][1]['decision'],'acceptForSession')
+
+    def test_approval_verification_refreshes_availability_not_request_version(self):
+        value=command();value['params']['availableDecisions']=['accept','acceptForSession','decline']
+        before=self.pending(value)
+        self.a.verified_capabilities.add('approval_extensions')
+        after=self.a.snapshot(True,'pc1')['pending'][0]
+        self.assertEqual(before['version'],after['version'])
+        self.assertNotEqual(before['availability_version'],after['availability_version'])
+        self.assertTrue(after['decisions'][1].get('supported',True))
 
     def test_definitively_rejected_answer_can_be_manually_submitted_after_reconnect(self):
         from desktop_ipc import DesktopUnavailable

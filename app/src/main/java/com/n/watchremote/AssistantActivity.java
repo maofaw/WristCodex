@@ -227,7 +227,7 @@ public class AssistantActivity extends MainActivity {
     if(!phase.getText().toString().equals(text))phase.setText(text);
     JSONArray pending=viewingActive()?current.optJSONArray("pending"):null;
     JSONObject item=pending==null?null:pending.optJSONObject(0);
-    String key=item==null?"":viewed+":"+item.optString("id")+":"+item.optString("version")+":"+item.optBoolean("supported",true)+":"+item.optString("delivery_status");
+    String key=item==null?"":viewed+":"+item.optString("id")+":"+item.optString("version")+":"+item.optString("availability_version")+":"+item.optBoolean("supported",true)+":"+item.optString("delivery_status");
     if(!key.equals(pendingKey)){
       pendingKey=key;pendingPanel.removeAllViews();if(item!=null){showPending(item);list.setSelection(0);}
     }
@@ -599,12 +599,19 @@ public class AssistantActivity extends MainActivity {
       addControl(pendingPanel,control("查看操作详情",false,()->showPages("操作详情",item.optString("detail"))));
       JSONArray decisions=item.optJSONArray("decisions");
       if(decisions!=null){
+        boolean needsComputer=false;
         for(int n=0;n<decisions.length();n++){
           JSONObject option=decisions.optJSONObject(n);if(option==null)continue;
           String decision=option.optString("value");
           if(!option.optString("detail").isEmpty())addControl(pendingPanel,control("查看规则详情",false,()->showPages("规则详情",option.optString("detail"))));
-          addControl(pendingPanel,control(option.optString("label"),decision.equals("accept"),()->answer(id,decision,null,null,thread,turn,version)));
+          Button choice=control(option.optString("label"),decision.equals("accept"),()->answer(id,decision,null,null,thread,turn,version));
+          if(!option.optBoolean("supported",true)){
+            choice.setEnabled(false);choice.setTextColor(MUTED);needsComputer=true;
+            pendingPanel.addView(label(option.optString("unavailable_reason","此授权范围请在电脑处理"),12));
+          }
+          addControl(pendingPanel,choice);
         }
+        if(needsComputer)addControl(pendingPanel,control("在电脑打开此对话",false,()->openOnDesktop(thread)));
       }else{
         addControl(pendingPanel,control("仅本次允许",true,()->answer(id,"accept",null,null,thread,turn,version)));
         addControl(pendingPanel,control("拒绝",false,()->answer(id,"decline",null,null,thread,turn,version)));
