@@ -7,12 +7,16 @@ import os
 from pathlib import Path
 import threading
 import time
+import copy
 from urllib.parse import quote
 
 from conversations import Conversations
 from desktop_ipc import DesktopIPC, DesktopUnavailable, DeliveryUnknown, native_text
 from record_manager import RecordManager
 from ai_bridge import WORKSPACE
+from decisions import validate_form, validate_permissions, digest
+from runtime_verification import verified_actions
+from thread_management import ThreadManagement
 
 
 LOG = logging.getLogger(__name__)
@@ -43,7 +47,7 @@ class SharedConversations(Conversations):
         return value
 
 
-class SharedAssistant:
+class SharedAssistant(ThreadManagement):
     def __init__(self, legacy, file=None, desktop=None, open_thread=None, record_factory=None):
         self.legacy = legacy
         self.store = legacy.store
@@ -70,6 +74,8 @@ class SharedAssistant:
         self.preview_published_at = {}
         self.next_preview_at = None
         self.request_timings = OrderedDict()
+        self.verified_capabilities = verified_actions(self.file.with_name('desktop-capabilities.json'))
+        self.verification_generation = -1
 
     def persist(self):
         with self.preference_lock:
@@ -85,7 +91,7 @@ class SharedAssistant:
         self.legacy.ensure()
 
     def call(self, method, params):
-        if method not in ('thread/read', 'thread/list', 'thread/items/list'):
+        if method not in ('thread/read', 'thread/list', 'thread/items/list', 'model/list', 'collaborationMode/list'):
             raise RuntimeError('此通道仅用于读取历史')
         return self.legacy.call(method, params)
 
@@ -273,7 +279,57 @@ class SharedAssistant:
         pending = self.attention()
         value.update(attention_preview=pending['items'], attention_count=pending['total'],
             attention_conversations=pending['conversations'], attention_keys=pending['keys'])
+        value['capabilities'] = self.capabilities(value)
+        value['pending'] = [self.decision_status(p) for p in value.get('pending', [])]
         return value
+
+    def refresh_verification(self):
+        generation = getattr(self.desktop, 'connection_generation', None)
+        if generation is not None and generation != self.verification_generation and self.desktop.connected:
+            self.verified_capabilities = verified_actions(self.file.with_name('desktop-capabilities.json'))
+            self.verification_generation = generation
+
+    def capabilities(self, live=None):
+        self.refresh_verification()
+        connected = self.desktop.connected
+        result = {}
+        for name in ('permissions', 'forms', 'async_questions', 'plan_execute', 'plan_modify',
+                'settings', 'rename', 'archive', 'restore'):
+            available = connected and name in self.verified_capabilities
+            # No atomic native plan action or bound async response exists in the
+            # adapter yet. An evidence file cannot grant an unimplemented action.
+            if name in ('async_questions', 'plan_execute', 'plan_modify'):
+                available = False
+            result[name] = dict(available=available, reason='' if available else
+                '电脑客户端未连接' if not connected else '本机接口尚未通过验证，请在电脑处理')
+        return result
+
+    def decision_status(self, view):
+        self.refresh_verification()
+        value = copy.deepcopy(view)
+        feature = {'permissions': 'permissions', 'form': 'forms'}.get(value.get('kind'))
+        if feature and feature not in self.verified_capabilities:
+            value.update(supported=False, unavailable_reason='本机此类确认接口尚未通过验证，请在电脑处理')
+        key = 'decision:' + digest([value.get('id'), value.get('version')])
+        old = self.store.receipt(key)
+        if old and old.get('status') in ('sending', 'unknown', 'accepted'):
+            value.update(supported=False, unavailable_reason='此回答已提交或送达未知，请刷新确认，不会重复发送',
+                delivery_status=old['status'])
+        return value
+
+    @staticmethod
+    def client_snapshot(value, protocol=5):
+        if protocol >= 6:
+            return value
+        result = copy.deepcopy(value)
+        for item in result.get('pending', []):
+            structured_rules = any(str(o.get('value','')).startswith('option:') for o in item.get('decisions',[]) if isinstance(o,dict))
+            if not item.get('supported') or item.get('kind') not in ('questions', 'approval', 'manual') or item.get('source') == 'async_questions' or structured_rules:
+                reason = item.get('unavailable_reason') or '此请求需要新版手表，请在电脑处理'
+                for key in ('questions', 'permissions', 'fields', 'decisions'):
+                    item.pop(key, None)
+                item.update(kind='manual', supported=False, detail=reason)
+        return result
 
     def events(self, after, compact=False, thread_id=None):
         with self.cv:
@@ -478,18 +534,49 @@ class SharedAssistant:
                 self.store.record(request_id, receipt)
             return dict(self.snapshot(True, thread_id), supplement_accepted=True)
 
-    def answer(self, token, decision=None, answers=None, thread_id=None, turn_id=None):
+    def answer(self, token, decision=None, answers=None, thread_id=None, turn_id=None, expected_version=None, response=None):
         with self.operation_lock:
             owner, _, (view, raw) = self.target(thread_id, turn_id, token)
+            new_kind = view['kind'] not in ('questions', 'approval', 'manual') or view.get('source') == 'async_questions' or isinstance(decision,str) and decision.startswith('option:')
+            if ((expected_version is not None and expected_version != view.get('version'))
+                    or new_kind and not expected_version):
+                raise ValueError('请求内容已变化或缺少操作版本，请刷新后决定')
+            receipt_key = 'decision:' + digest([token, view.get('version')])
+            old = self.store.receipt(receipt_key)
+            if old:
+                if old.get('status') in ('sending', 'unknown'):
+                    raise DeliveryUnknown('回答送达未知，请先在电脑核对，不会重复发送')
+                if old.get('status') != 'rejected':
+                    raise RuntimeError('此回答已经提交，请刷新')
+            view = self.decision_status(view)
             if not view['supported']:
-                raise RuntimeError('此类请求请在电脑处理')
+                raise RuntimeError(view.get('unavailable_reason') or '此类请求请在电脑处理')
             params = dict(conversationId=thread_id, requestId=raw['id'])
             if view['kind'] == 'approval':
                 if decision not in [o['value'] for o in view['decisions']]:
                     raise ValueError('此确认选项不适用')
                 params['decision'] = decision
+                if decision.startswith('option:'):
+                    params['decision'] = next((o for o in raw['params'].get('availableDecisions', [])
+                        if isinstance(o, dict) and 'option:' + digest(o) == decision), None)
+                    if params['decision'] is None:
+                        raise ValueError('原始授权选项已变化')
                 method = 'thread-follower-command-approval-decision' if raw['method'].startswith('item/commandExecution') else 'thread-follower-file-approval-decision'
-            else:
+            elif view['kind'] == 'permissions':
+                params['response'] = validate_permissions(view['permissions'], response)
+                method = 'thread-follower-permissions-request-approval-response'
+            elif view['kind'] == 'form':
+                if not isinstance(response, dict) or set(response) - {'action', 'content'} or response.get('action') not in ('accept', 'decline', 'cancel'):
+                    raise ValueError('表单回答无效')
+                if response['action'] == 'accept':
+                    content = validate_form(view['fields'], response.get('content'))
+                else:
+                    if response.get('content') is not None:
+                        raise ValueError('拒绝或取消时不能提交表单内容')
+                    content = None
+                params['response'] = dict(action=response['action'], content=content)
+                method = 'thread-follower-submit-mcp-server-elicitation-response'
+            elif view['kind'] == 'questions':
                 if not isinstance(answers, dict) or any(not isinstance(answers.get(q['id']), str)
                         or not answers[q['id']].strip() or len(answers[q['id']]) > 4000 for q in view['questions']):
                     raise ValueError('请回答全部问题')
@@ -498,7 +585,18 @@ class SharedAssistant:
                         raise ValueError('请选择电脑提供的原始选项')
                 params['response'] = dict(answers={q['id']: dict(answers=[answers[q['id']]]) for q in view['questions']})
                 method = 'thread-follower-submit-user-input'
-            self.desktop.request(method, params, owner)
+            else:
+                raise DesktopUnavailable('此类型没有已验证的提交接口，请在电脑处理')
+            receipt = dict(thread_id=thread_id, turn_id=turn_id, status='sending', fingerprint=digest(params))
+            self.store.record(receipt_key, receipt)
+            try:
+                self.desktop.request(method, params, owner)
+                receipt['status'] = 'accepted'
+            except Exception as exc:
+                receipt['status'] = 'rejected' if isinstance(exc, DesktopUnavailable) else 'unknown'
+                raise
+            finally:
+                self.store.record(receipt_key, receipt)
         return self.snapshot(True, thread_id)
 
     def stop(self, thread_id=None, turn_id=None):

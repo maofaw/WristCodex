@@ -89,10 +89,13 @@ class Conversations:
         if not self.store.owns(ident) and self.metadata(ident)['readonly']:
             raise RuntimeError('电脑对话当前只读，请新建手表对话')
 
-    def list(self,cursor=None):
+    def list(self,cursor=None,archived=False):
         if cursor is not None and (not isinstance(cursor,str) or len(cursor)>4096):raise ValueError('分页编号无效')
-        result=self.rpc('thread/list',dict(limit=20,cursor=cursor,sortKey='updated_at',sortDirection='desc',useStateDbOnly=True))
+        params=dict(limit=20,cursor=cursor,sortKey='updated_at',sortDirection='desc',useStateDbOnly=True)
+        if archived:params['archived']=True
+        result=self.rpc('thread/list',params)
         rows=[self.describe(t) for t in result['data'] if not t.get('ephemeral') and not t.get('parentThreadId')]
+        for row in rows:row['archived']=archived
         return dict(conversations=rows,next_cursor=result.get('nextCursor'),active=self.assistant.snapshot(True))
 
     @staticmethod

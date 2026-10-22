@@ -156,6 +156,7 @@ public class AssistantMonitor extends Service {
         connection=(HttpURLConnection)new URL(base+"/assistant/events?compact=1&after="+revision+
           (target.isEmpty()?"":"&thread_id="+URLEncoder.encode(target,"UTF-8"))+"&t="+URLEncoder.encode(token,"UTF-8")).openConnection();
         connection.setConnectTimeout(5000);connection.setReadTimeout(28000);
+        connection.setRequestProperty("X-WristCodex-Protocol","6");
         if(connection.getResponseCode()!=200)throw new IOException("连接未成功");
         StringBuilder body=new StringBuilder();
         try(Reader r=new InputStreamReader(connection.getInputStream(),StandardCharsets.UTF_8)){

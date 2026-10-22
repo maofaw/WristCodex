@@ -51,7 +51,16 @@ def session_locked():
   return "LogonUI.exe" in out.stdout
 
 class Handler(BaseHTTPRequestHandler):
+  def client_protocol(self):
+    value=self.headers.get('X-WristCodex-Protocol','5')
+    if value not in ('5','6'):raise ValueError('Unsupported watch protocol')
+    return int(value)
+
   def reply_json(self, code, value):
+    if isinstance(assistant,SharedAssistant) and isinstance(value,dict):
+      value=assistant.client_snapshot(value,self.client_protocol())
+      if isinstance(value.get('active'),dict):
+        value=dict(value,active=assistant.client_snapshot(value['active'],self.client_protocol()))
     body=json.dumps(value,ensure_ascii=False).encode('utf-8')
     self.send_response(code)
     self.send_header('Content-Type','application/json; charset=utf-8')
@@ -71,6 +80,8 @@ class Handler(BaseHTTPRequestHandler):
     if parse_qs(url.query).get("t", [""])[0] != TOKEN:
       self.reply(403, "bad token")
       return
+    try:self.client_protocol()
+    except ValueError as exc:self.reply(400,str(exc));return
     if url.path == "/lock":
       ctypes.windll.user32.LockWorkStation()
       self.reply(200, "locked")
@@ -100,12 +111,22 @@ class Handler(BaseHTTPRequestHandler):
     elif url.path == '/assistant/attention':
       try:self.reply_json(200,assistant.attention(int(parse_qs(url.query).get('cursor',['0'])[0])))
       except ValueError as exc:self.reply(400,str(exc))
+    elif url.path in ('/assistant/conversations/settings','/assistant/conversations/manage'):
+      try:
+        if not isinstance(assistant,SharedAssistant):raise ValueError('此功能需要电脑共享模式')
+        ident=parse_qs(url.query).get('thread_id',[''])[0]
+        self.reply_json(200,assistant.thread_settings(ident) if url.path.endswith('/settings') else assistant.thread_management(ident))
+      except ValueError as exc:self.reply(400,str(exc))
+      except RuntimeError as exc:self.reply(409,str(exc))
     elif url.path.startswith('/assistant/conversations'):
       try:
         query=parse_qs(url.query);cursor=query.get('cursor',[None])[0]
         if cursor is not None and len(cursor)>4096:raise ValueError('分页编号无效')
         ident=query.get('thread_id',[''])[0]
-        if url.path=='/assistant/conversations':value=assistant.conversations.list(cursor)
+        if url.path=='/assistant/conversations':
+          archived=query.get('archived',['0'])[0]
+          if archived not in ('0','1'):raise ValueError('归档筛选无效')
+          value=assistant.conversations.list(cursor,archived=True) if archived=='1' else assistant.conversations.list(cursor)
         elif url.path=='/assistant/conversations/messages':value=assistant.conversations.messages(ident,cursor)
         elif url.path=='/assistant/conversations/message':
           value=assistant.conversations.message(ident,query.get('item_id',[''])[0],int(query.get('page',['0'])[0]))
@@ -118,10 +139,12 @@ class Handler(BaseHTTPRequestHandler):
 
   def do_POST(self):
     url = urlparse(self.path)
+    payload = {}
     if not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + TOKEN):
       self.reply(403, 'bad token')
       return
     try:
+      self.client_protocol()
       length = int(self.headers.get('Content-Length', '0'))
       if url.path == '/assistant/voice':
         if not 1000 <= length <= 1100000:
@@ -143,7 +166,21 @@ class Handler(BaseHTTPRequestHandler):
       elif url.path == '/assistant/send':
         self.reply_json(202,assistant.send(payload.get('prompt'),payload.get('request_id'),payload.get('new',False),payload.get('thread_id')))
       elif url.path == '/assistant/answer':
-        self.reply_json(200,assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers'),payload.get('thread_id'),payload.get('turn_id')))
+        if self.client_protocol()<6 and str(payload.get('decision','')).startswith('option:'):
+          raise ValueError('此授权规则需要新版手表完整显示，请在电脑处理')
+        if isinstance(assistant,SharedAssistant):
+          value=assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers'),payload.get('thread_id'),payload.get('turn_id'),payload.get('expected_version'),payload.get('response'))
+        else:value=assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers'),payload.get('thread_id'),payload.get('turn_id'))
+        self.reply_json(200,value)
+      elif url.path == '/assistant/conversations/open':
+        if not isinstance(assistant,SharedAssistant):raise ValueError('此功能需要电脑共享模式')
+        self.reply_json(200,assistant.open_on_desktop(payload.get('thread_id')))
+      elif url.path in ('/assistant/conversations/settings','/assistant/conversations/manage'):
+        if not isinstance(assistant,SharedAssistant):raise ValueError('此功能需要电脑共享模式')
+        if url.path.endswith('/settings'):
+          value=assistant.save_thread_settings(payload.get('thread_id'),payload.get('changes'),payload.get('expected_version'),payload.get('operation_id'))
+        else:value=assistant.manage_thread(payload.get('thread_id'),payload.get('action'),payload.get('expected_version'),payload.get('operation_id'),payload.get('name'),payload.get('confirmed',False))
+        self.reply_json(200,value)
       elif url.path == '/assistant/steer':
         self.reply_json(200,assistant.steer(payload.get('prompt'),payload.get('request_id'),payload.get('thread_id'),payload.get('turn_id')))
       elif url.path == '/assistant/stop':
@@ -155,9 +192,15 @@ class Handler(BaseHTTPRequestHandler):
       else:
         self.reply(404, 'unknown')
     except (ValueError, UnicodeError) as exc:
-      self.reply(400, str(exc))
+      self.post_error(url.path, payload, 400, exc)
     except RuntimeError as exc:
-      self.reply(409, str(exc))
+      self.post_error(url.path, payload, 409, exc)
+
+  def post_error(self, path, payload, code, exc):
+    if isinstance(assistant, SharedAssistant) and isinstance(payload, dict) and path in ('/assistant/conversations/settings','/assistant/conversations/manage'):
+      kind='settings' if path.endswith('/settings') else 'manage'
+      self.reply_json(code,dict(error=str(exc),delivery_status=assistant.operation_delivery(kind,payload.get('thread_id'),payload.get('operation_id'))))
+    else:self.reply(code,str(exc))
 
   def log_message(self, fmt, *args):
     pass

@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from decisions import decision_view, questions_valid, bounded
 
 
 PIPE = r'\\.\pipe\codex-ipc'
@@ -26,6 +27,9 @@ VERSIONS = {
     'thread-follower-command-approval-decision': 1,
     'thread-follower-file-approval-decision': 1,
     'thread-follower-submit-user-input': 1,
+    'thread-follower-permissions-request-approval-response': 1,
+    'thread-follower-submit-mcp-server-elicitation-response': 1,
+    'thread-follower-update-thread-settings': 2,
 }
 MAX_FRAME = 64 * 1024 * 1024  # PC-side only; snapshots are projected immediately.
 
@@ -115,10 +119,35 @@ def turns_in(state):
         (str(i), t) for i, t in enumerate(state.get('turns') or [])]
 
 
+def answered_question_ids(item):
+    """Keep only native question IDs; never retain reply text in the projection."""
+    parts = item.get('content') if item.get('type') == 'userMessage' else item.get('input')
+    if not isinstance(parts, list) or len(parts) != 1 or not isinstance(parts[0], dict) or parts[0].get('type') != 'text':
+        return []
+    text = parts[0].get('text')
+    if not isinstance(text, str) or len(text) > 16000:
+        return []
+    text = text.strip()
+    start, end = '<send_user_message_question_reply>', '</send_user_message_question_reply>'
+    if not text.startswith(start) or not text.endswith(end):
+        return []
+    try:
+        answers = json.loads(text[len(start):-len(end)])
+        if isinstance(answers, dict):answers = [answers]
+        if not isinstance(answers, list) or not 0 < len(answers) <= 64:
+            return []
+        if any(not isinstance(a, dict) or not all(isinstance(a.get(k), str) for k in ('questionItemId','question','answer'))
+                or len(a['questionItemId']) > 600 for a in answers):
+            return []
+        return [a['questionItemId'] for a in answers]
+    except (ValueError, TypeError):
+        return []
+
+
 class Projection:
     """Keep headers, pending requests and bounded review data, never full history."""
     FIELDS = ('id', 'hostId', 'title', 'cwd', 'threadRuntimeStatus',
-        'latestModel', 'latestCollaborationMode', 'currentPermissions', 'latestThreadSettings')
+        'latestModel', 'latestReasoningEffort', 'latestCollaborationMode', 'currentPermissions', 'latestThreadSettings')
 
     def __init__(self, owner):
         self.owner = owner
@@ -158,10 +187,21 @@ class Projection:
             # Error messages/details may contain private endpoints and tokens.
             return dict(type='error', willRetry=item.get('willRetry') is True)
         value = {k: item.get(k) for k in ('id', 'type', 'phase')}
+        if item.get('type') == 'agentMessage' and item.get('unrenderable_questions'):
+            value['unrenderable_questions'] = True
+        if item.get('type') in ('userMessage', 'steeringUserMessage'):
+            value['status'] = item.get('status')
+            value['_answered_question_ids'] = item.get('_answered_question_ids') or answered_question_ids(item)
         if item.get('type') == 'agentMessage' and item.get('phase') in (None, 'commentary', 'final_answer'):
             text = str(item.get('text') or '')
             value['text'] = text[:20000]
             value['_text_digest'] = item.get('_text_digest') or hashlib.sha256(text.encode()).hexdigest()
+            if isinstance(item.get('questions'), list) and bounded(item['questions']):
+                value['questions'] = item['questions']
+            elif item.get('questions'):
+                value['unrenderable_questions'] = True
+        elif item.get('type') == 'agentMessage' and item.get('questions'):
+            value['unrenderable_questions'] = True
         if item.get('type') == 'fileChange':
             changes = item.get('changes') or []
             if len(json.dumps(changes, ensure_ascii=False)) <= 10000:
@@ -292,12 +332,21 @@ class Projection:
             else:
                 index, field = tail[:2]
                 item = self.message_items[index]
-                if field in ('id', 'type', 'phase', 'text', 'changes', 'willRetry'):
+                if item.get('type') in ('userMessage', 'steeringUserMessage'):
+                    if field in ('input', 'content'):
+                        raise ValueError('回答内容更新后重新读取原始状态')
+                    if field == 'status':
+                        item['status'] = patch.get('value')
+                if field in ('id', 'type', 'phase', 'text', 'changes', 'willRetry', 'questions'):
                     if field == 'text' and item.get('type') != 'agentMessage':
                         self.remember_item(item)
                         return
                     if field == 'text':
                         item.pop('_text_digest', None)
+                    if field == 'questions' and len(tail) > 2 and 'questions' not in item:
+                        item['questions'] = []
+                    if field == 'questions':
+                        item.pop('unrenderable_questions',None)
                     item = patch_value(item, dict(patch, path=tail[1:]))
                     self.message_items[index] = self.project_item(item)
                 # A resumed native reasoning item can precede an older retry in
@@ -356,50 +405,38 @@ class Projection:
     def pending(self):
         result = []
         for request in self.requests:
-            if not isinstance(request, dict):
+            view = decision_view(request, self.data, self.latest_turn(), self.items)
+            if view is not None:
+                result.append((view, request))
+        # Async prompts are native agentMessage.questions, not server requests.
+        # They must remain visible even when the public body is empty.
+        turn = self.latest_turn()
+        if turn.get('status') != 'inProgress' or not turn.get('turnId'):
+            return result
+        answered = {ident for item in self.message_items
+            if item.get('type') == 'userMessage' or item.get('type') == 'steeringUserMessage' and item.get('status') == 'accepted'
+            for ident in item.get('_answered_question_ids', [])}
+        for item in self.message_items:
+            if item.get('type') != 'agentMessage' or not item.get('questions') and not item.get('unrenderable_questions'):
                 continue
-            params = request.get('params') or {}
-            if not isinstance(params, dict) or not isinstance(request.get('id'), (str, int)):
+            questions = []
+            for index, question in enumerate(item.get('questions', [])[:7]):
+                if not isinstance(question, dict):
+                    continue
+                ident = json.dumps(['request_user_input_async', item.get('id'), index], ensure_ascii=False, separators=(',', ':'))
+                if ident in answered:
+                    continue
+                options = question.get('options') or []
+                questions.append(dict(id=ident, question=question.get('title'),
+                    options=[dict(label=o) if isinstance(o, str) else o for o in options],
+                    isOther=True,isSecret=question.get('isSecret',False)))
+            if not questions and not item.get('unrenderable_questions'):
                 continue
-            if params.get('threadId') != self.data.get('id'):
-                continue
-            method = request.get('method')
-            reviewer = (params.get('approvalsReviewer') or self.latest_turn().get('reviewer')
-                or (self.data.get('currentPermissions') or {}).get('approvalsReviewer') or 'user')
-            if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval') and reviewer != 'user':
-                # An automatic reviewer deciding an operation is not a request for
-                # the human. Never race that review with a watch approval.
-                continue
-            identity = [self.data['id'], params.get('turnId'), request.get('id')]
-            token = 'desktop:' + hashlib.sha256(json.dumps(identity).encode()).hexdigest()
-            view = dict(id=token, thread_id=self.data['id'], turn_id=params.get('turnId') or '',
-                title=self.data.get('title') or '电脑对话', summary=(params.get('reason') or '电脑需要你决定')[:120],
-                kind='manual', detail='请在电脑处理此类请求', supported=False)
-            if method in ('item/commandExecution/requestApproval', 'item/fileChange/requestApproval'):
-                command = method == 'item/commandExecution/requestApproval'
-                detail = params.get('command') if command else self.items.get(params.get('itemId'))
-                options = params.get('availableDecisions')
-                if options is None:
-                    options = ['accept', 'decline', 'cancel']
-                labels = {'accept': '仅本次允许', 'decline': '拒绝', 'cancel': '取消任务'}
-                decisions = [dict(value=o, label=labels[o]) for o in options if isinstance(o, str) and o in labels]
-                if detail and len(detail) <= 10000 and decisions:
-                    view.update(kind='approval', supported=True, detail=detail,
-                        summary=(params.get('reason') or ('允许执行这项电脑操作？' if command else '允许这些文件修改？'))[:120],
-                        decisions=decisions)
-            elif method == 'item/tool/requestUserInput':
-                questions = params.get('questions') or []
-                if isinstance(questions, list) and 0 < len(questions) <= 6 and len(json.dumps(questions, ensure_ascii=False)) <= 16000 and all(
-                        isinstance(q, dict) and isinstance(q.get('id'), str) and isinstance(q.get('question'), str)
-                        and not q.get('isSecret') and len(q['question']) <= 4000
-                        and isinstance(q.get('options') or [], list) and len(q.get('options') or []) <= 10
-                        and all(isinstance(o, dict) and isinstance(o.get('label'), str)
-                            and o['label'].strip() and len(o['label']) <= 200 and len(str(o.get('description') or '')) <= 1000
-                            for o in (q.get('options') or []))
-                        for q in questions) and len({q['id'] for q in questions}) == len(questions):
-                    view.update(kind='questions', supported=True, questions=questions,
-                        summary=questions[0].get('question', '需要你回答')[:120])
-            result.append((view, request))
+            raw = dict(id='async:' + str(item.get('id')), method='wrist/asyncQuestions', params=dict(
+                threadId=self.data.get('id'), turnId=self.latest_turn().get('turnId'), questions=questions))
+            view = decision_view(raw, self.data, self.latest_turn(), self.items)
+            if view:
+                result.append((view, raw))
         return result
 
     def expect_turn(self, turn_id, request_id, previous_turn_id, task, previous_started_at=None):
@@ -473,6 +510,7 @@ class DesktopIPC:
         self.sessions = {}
         self.waiters = {}
         self.running = False
+        self.connection_generation = 0
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='desktop-follow')
         self.scheduled = set()
 
@@ -547,6 +585,11 @@ class DesktopIPC:
         self.write(dict(type='broadcast', method='thread-stream-following-changed', version=1,
             sourceClientId=self.client_id, targetClientIds=[owner],
             params=dict(hostId='local', conversationId=ident, following=True)))
+
+    def record_restored(self, ident):
+        # Native app event after a successful metadata unarchive, never before.
+        self.write(dict(type='broadcast', method='thread-unarchived', version=1,
+            sourceClientId=self.client_id, params=dict(hostId='local', conversationId=ident)))
 
     def schedule(self, ident):
         with self.lock:
@@ -644,6 +687,7 @@ class DesktopIPC:
                         break
                 else:
                     raise DesktopUnavailable('桌面握手超时')
+                self.connection_generation += 1
                 self.connected = True
                 self.error = ''
                 self.on_change()

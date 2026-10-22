@@ -11,7 +11,8 @@ from ai_bridge import WORKSPACE, child_environment
 
 
 class RecordManager:
-    METHODS = frozenset(('thread/start', 'thread/name/set', 'thread/unsubscribe', 'thread/read'))
+    METHODS = frozenset(('thread/start', 'thread/name/set', 'thread/unsubscribe', 'thread/read',
+        'thread/archive', 'thread/unarchive'))
 
     def __init__(self):
         self.proc = None

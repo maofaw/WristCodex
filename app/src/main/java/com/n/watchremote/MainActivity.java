@@ -196,8 +196,10 @@ public class MainActivity extends Activity {
     HttpURLConnection c=(HttpURLConnection)validate(value).openConnection();
     if(opened!=null)opened.accept(c);
     c.setInstanceFollowRedirects(false); c.setConnectTimeout(4000);
+    c.setRequestProperty("X-WristCodex-Protocol","6");
     String path=c.getURL().getPath();
-    c.setReadTimeout(path.equals("/assistant/send")||path.equals("/assistant/activate")?60000:8000);
+    c.setReadTimeout(path.equals("/assistant/send")||path.equals("/assistant/activate")?60000:
+      path.equals("/assistant/conversations/manage")||path.equals("/assistant/conversations/settings")?20000:8000);
     c.setRequestMethod("POST".equals(method)?"POST":"GET");
     if(!bearer.isEmpty())c.setRequestProperty("Authorization","Bearer "+bearer);
     try {

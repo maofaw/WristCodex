@@ -10,8 +10,8 @@ android {
     applicationId = "com.n.watchremote"
     minSdk = 26
     targetSdk = 30
-    versionCode = 9
-    versionName = "0.5.1"
+    versionCode = 10
+    versionName = "0.6.0-rc1"
   }
   // Personal sideload app intentionally targets Android 11 for watch compatibility.
   lint { disable += "ExpiredTargetSdkVersion" }

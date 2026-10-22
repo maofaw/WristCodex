@@ -3,6 +3,39 @@ package com.n.watchremote;
 /** Bounded, framework-free decisions shared by the native UI and host-JVM tests. */
 final class UiState {
   private UiState(){}
+  static int effortIndex(String current,String[] values){
+    for(int i=0;i<values.length;i++)if(values[i].equals(current))return i+1;
+    return 0;
+  }
+  static String effortValue(int index,String[] values){return index>0&&index<=values.length?values[index-1]:null;}
+  static int swipePage(float dx,float dy,float startX,float screenWidth){
+    if(startX<24||startX>screenWidth-24||Math.abs(dx)<48||Math.abs(dx)<=1.5f*Math.abs(dy))return 0;
+    return dx<0?1:-1;
+  }
+  static final class Pager {
+    final java.util.ArrayList<String> cursors=new java.util.ArrayList<>();
+    int page,target;boolean loading,next,reset;
+    Pager(){cursors.add("");}
+    boolean canPrevious(){return !loading&&page>0;}
+    boolean canNext(){return !loading&&next;}
+    String first(){if(loading)return null;loading=true;target=0;reset=true;return "";}
+    String begin(int direction){
+      if(direction!=1&&direction!=-1)return null;
+      if(direction>0?!canNext():!canPrevious())return null;
+      target=page+direction;
+      if(target<0||target>=cursors.size())return null;
+      loading=true;reset=false;return cursors.get(target);
+    }
+    void success(String following){
+      if(!loading)return;
+      if(reset){cursors.clear();cursors.add("");}
+      page=target;next=following!=null&&!following.isEmpty()&&!following.equals("null");
+      while(cursors.size()>page+1)cursors.remove(cursors.size()-1);
+      if(next)cursors.add(following);
+      loading=false;reset=false;
+    }
+    void failed(){loading=false;reset=false;}
+  }
   static String answerText(String value){
     return value.trim().isEmpty()?null:value;
   }

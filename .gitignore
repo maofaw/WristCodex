@@ -28,4 +28,5 @@ __pycache__/
 **/assistant-state-conversations/
 **/assistant-desktop.json
 **/assistant-desktop.tmp
+**/desktop-capabilities.json
 **/voice-*.wav

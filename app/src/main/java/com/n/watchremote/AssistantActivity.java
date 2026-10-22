@@ -25,7 +25,9 @@ public class AssistantActivity extends MainActivity {
   LinearLayout root,composer,pendingPanel;
   ListView list;
   EditText prompt;
-  Button titleBar,mic,sendButton,olderButton,listMore,attentionButton,moreButton;
+  Button titleBar,mic,sendButton,olderButton,listMore,listPrevious,attentionButton,moreButton;
+  UiState.Pager conversationPages=new UiState.Pager();
+  boolean archivedList;
   TextView phase;
   JSONObject current=new JSONObject();
   JSONObject connectionState=new JSONObject();
@@ -38,6 +40,7 @@ public class AssistantActivity extends MainActivity {
   String attentionStamp="";
   String attentionPage="";
   String automaticHint="";
+  String recoveryKey="";
   volatile int navigation;
   Handler ui=new Handler(Looper.getMainLooper());
   final ExecutorService controls=Executors.newSingleThreadExecutor();
@@ -96,7 +99,7 @@ public class AssistantActivity extends MainActivity {
     attentionButton=control("待处理",false,()->openAttention(""));attentionButton.setVisibility(View.GONE);
     stateRow.addView(attentionButton,new LinearLayout.LayoutParams(dp(94),dp(48)));root.addView(stateRow);
     status=label("",12);
-    list=new ListView(this);list.setBackgroundColor(Color.BLACK);list.setDivider(null);
+    list=new ConversationList(this);list.setBackgroundColor(Color.BLACK);list.setDivider(null);
     list.setCacheColorHint(Color.BLACK);list.setScrollingCacheEnabled(false);list.setClipToPadding(true);
     list.setOnScrollListener(new AbsListView.OnScrollListener(){
       public void onScrollStateChanged(AbsListView v,int state){dragging=state!=SCROLL_STATE_IDLE;if(!dragging&&!listMode&&historyWindow.deferred)updateChat();}
@@ -114,7 +117,7 @@ public class AssistantActivity extends MainActivity {
     AssistantMonitor.selectView(viewed);
   }
   void showChat(boolean load){
-    saveDraft();historyWindow.loaded(false);listMode=false;attentionMode=false;loadingHistory=false;pendingKey="";historyStamp="";historyCursor="";rows.clear();
+    saveDraft();historyWindow.loaded(false);listMode=false;attentionMode=false;loadingHistory=false;pendingKey="";recoveryKey="";historyStamp="";historyCursor="";rows.clear();
     if(shared()&&!viewed.equals(current.optString("thread_id")))current=new JSONObject();
     shell(viewTitle+" ▾");
     olderButton=control("加载更早消息",false,()->loadHistory(true));
@@ -219,12 +222,23 @@ public class AssistantActivity extends MainActivity {
     if(!phase.getText().toString().equals(text))phase.setText(text);
     JSONArray pending=viewingActive()?current.optJSONArray("pending"):null;
     JSONObject item=pending==null?null:pending.optJSONObject(0);
-    String key=item==null?"":viewed+":"+item.optString("id");
+    String key=item==null?"":viewed+":"+item.optString("id")+":"+item.optString("version")+":"+item.optBoolean("supported",true)+":"+item.optString("delivery_status");
     if(!key.equals(pendingKey)){
       pendingKey=key;pendingPanel.removeAllViews();if(item!=null){showPending(item);list.setSelection(0);}
     }
+    if(item==null){
+      String failure=current.optString("state").equals("failed")?viewed+":"+current.optString("turn_id"):"";
+      if(!failure.equals(recoveryKey)){
+        recoveryKey=failure;pendingPanel.removeAllViews();
+        if(!failure.isEmpty()){
+          pendingPanel.addView(label("任务未完成，需要你决定下一步",15));
+          addControl(pendingPanel,control("输入后续处理意见",false,()->{if(prompt!=null){prompt.requestFocus();((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).showSoftInput(prompt,InputMethodManager.SHOW_IMPLICIT);}}));
+          addControl(pendingPanel,control("在电脑查看",false,()->openOnDesktop(viewed)));
+        }
+      }
+    }else recoveryKey="";
     int count=connectionState.optInt("attention_count");
-    attentionButton.setVisibility(shared()&&count>0?View.VISIBLE:View.INVISIBLE);attentionButton.setText("待办 "+count);
+    attentionButton.setVisibility(shared()&&count>0?View.VISIBLE:View.INVISIBLE);setText(attentionButton,"待办 "+count);
     boolean blocked=!shared()&&running()&&!viewingActive();
     boolean cannotSteer=shared()&&running()&&!current.optBoolean("can_steer");
     boolean cannotSend=!canSubmit();
@@ -257,7 +271,7 @@ public class AssistantActivity extends MainActivity {
       try{
         JSONObject result=decode(work.run());
         runOnUiThread(()->{if(!isDestroyed()&&active&&expected==navigation)done.accept(result);});
-      }catch(Exception e){runOnUiThread(()->{if(!isDestroyed()&&active&&expected==navigation){loadingHistory=false;hint("读取失败，可在更多中刷新");}});}
+      }catch(Exception e){runOnUiThread(()->{if(!isDestroyed()&&active&&expected==navigation){loadingHistory=false;if(listMode&&!attentionMode&&conversationPages.loading){conversationPages.failed();updatePageControls();}hint("读取失败，可在更多中刷新");}});}
     });
   }
   void cancelRead(){
@@ -268,9 +282,21 @@ public class AssistantActivity extends MainActivity {
     try{return request(address,"GET","","",c->readConnection=c);}
     finally{readConnection=null;}
   }
+  static final class RequestFailure extends IOException{
+    final boolean notApplied;
+    RequestFailure(String message,boolean known){super(message);notApplied=known;}
+  }
   JSONObject decode(String raw)throws Exception{
     int at=raw.indexOf('\n');
-    if(!(raw.startsWith("HTTP 200\n")||raw.startsWith("HTTP 202\n")))throw new IOException(at<0?raw:raw.substring(at+1));
+    if(!(raw.startsWith("HTTP 200\n")||raw.startsWith("HTTP 202\n"))){
+      String body=at<0?raw:raw.substring(at+1);
+      JSONObject failure=null;try{failure=new JSONObject(body);}catch(JSONException ignored){}
+      if(failure!=null&&failure.has("delivery_status")){
+        String delivery=failure.optString("delivery_status");
+        throw new RequestFailure(failure.optString("error",body),delivery.equals("not_sent")||delivery.equals("rejected"));
+      }
+      throw new IOException(body);
+    }
     return new JSONObject(raw.substring(at+1));
   }
   String url(String path)throws Exception{return endpoint(path)+(path.contains("?")?"&":"?")+"t="+URLEncoder.encode(get("token"),"UTF-8");}
@@ -312,30 +338,82 @@ public class AssistantActivity extends MainActivity {
     });
   }
   void openList(){
+    openList(false);
+  }
+  void openList(boolean archived){
     if(voiceWorking){hint("请先结束录音并等待识别完成");return;}
+    archivedList=archived;conversationPages=new UiState.Pager();
     saveDraft();prompt=null;listMode=true;attentionMode=false;loadingHistory=false;rows.clear();listCursor="";
-    shell("对话列表");
-    Button create=control("＋ 新建对话",false,this::newConversation);
+    shell(archived?"已归档对话":"对话列表");
+    Button create=control(archived?"返回最近对话":"＋ 新建对话",false,archived?this::openList:this::newConversation);
     list.addHeaderView(create,null,false);
     LinearLayout footer=new LinearLayout(this);footer.setOrientation(LinearLayout.VERTICAL);
-    listMore=control("加载更多",false,()->{if(!listCursor.isEmpty())loadConversations(listCursor);});listMore.setEnabled(false);addControl(footer,listMore);
-    Button first=control("返回最近对话",false,()->loadConversations(""));addControl(footer,first);list.addFooterView(footer,null,false);
+    LinearLayout pageRow=new LinearLayout(this);pageRow.setOrientation(LinearLayout.HORIZONTAL);
+    listPrevious=control("上一页",false,()->flipConversations(-1));listMore=control("下一页",false,()->flipConversations(1));
+    pageRow.addView(listPrevious,new LinearLayout.LayoutParams(0,dp(48),1));
+    LinearLayout.LayoutParams nextLp=new LinearLayout.LayoutParams(0,dp(48),1);nextLp.setMargins(dp(6),0,0,0);pageRow.addView(listMore,nextLp);
+    footer.addView(pageRow);
+    Button first=control(archived?"返回归档首页":"返回最近对话",false,()->loadConversations(""));addControl(footer,first);list.addFooterView(footer,null,false);
     adapter=new Rows();list.setAdapter(adapter);
     list.setOnItemClickListener((p,v,pos,id)->{
       int at=pos-list.getHeaderViewsCount();if(at<0||at>=rows.size())return;
-      JSONObject item=rows.get(at);viewed=item.optString("id");viewTitle=item.optString("title");readOnly=item.optBoolean("readonly",true);persistView();showChat(true);
+      JSONObject item=rows.get(at);
+      if(archivedList){conversationManagement(item.optString("id"),true);return;}
+      viewed=item.optString("id");viewTitle=item.optString("title");readOnly=item.optBoolean("readonly",true);persistView();showChat(true);
     });
     root.addView(status);status.setMaxLines(2);loadConversations("");
   }
   void loadConversations(String cursor){
-    final int epoch=navigation;phase.setText("按最近更新时间排列");
-    query(()->readRequest(url("/assistant/conversations"+(cursor.isEmpty()?"":"?cursor="+enc(cursor)))),epoch,data->{
+    if(!cursor.isEmpty())return;
+    String target=conversationPages.first();if(target!=null)readConversationPage(target);
+  }
+  void flipConversations(int direction){
+    if(!listMode||attentionMode)return;
+    String target=conversationPages.begin(direction);
+    if(target!=null)readConversationPage(target);
+    else if(!conversationPages.loading)hint(direction<0?"已经是第一页":"已经是最后一页");
+  }
+  void updatePageControls(){
+    if(!listMode||attentionMode||listPrevious==null||listMore==null)return;
+    listPrevious.setEnabled(conversationPages.canPrevious());listMore.setEnabled(conversationPages.canNext());
+    setText(phase,"第 "+(conversationPages.page+1)+" 页 · "+(conversationPages.loading?"读取中":"左右滑动可翻页"));
+  }
+  void readConversationPage(String cursor){
+    final int epoch=navigation;updatePageControls();
+    final boolean archived=archivedList;
+    query(()->readRequest(url("/assistant/conversations?archived="+(archived?"1":"0")+(cursor.isEmpty()?"":"&cursor="+enc(cursor)))),epoch,data->{
       rows.clear();JSONArray items=data.optJSONArray("conversations");if(items!=null)for(int i=0;i<items.length();i++)rows.add(items.optJSONObject(i));
       listCursor=data.optString("next_cursor","");if(listCursor.equals("null"))listCursor="";
-      listMore.setEnabled(!listCursor.isEmpty());listMore.setText(listCursor.isEmpty()?"已到列表末尾":"加载更多");
+      conversationPages.success(listCursor);updatePageControls();
       adapter.notifyDataSetChanged();list.setSelection(0);hint(listCursor.isEmpty()?"已到列表末尾":"每页 20 段 · 点标题返回聊天");
       JSONObject state=data.optJSONObject("active");if(state!=null)applyState(state);
     });
+  }
+  final class ConversationList extends ListView{
+    float startX,startY;boolean horizontal,vertical,eligible;
+    final int slop=ViewConfiguration.get(AssistantActivity.this).getScaledTouchSlop();
+    ConversationList(Context context){super(context);}
+    @Override public boolean dispatchTouchEvent(MotionEvent event){
+      if(!listMode||attentionMode)return super.dispatchTouchEvent(event);
+      int action=event.getActionMasked();
+      if(action==MotionEvent.ACTION_DOWN){startX=event.getRawX();startY=event.getRawY();horizontal=false;vertical=false;
+        int row=pointToPosition((int)event.getX(),(int)event.getY());
+        eligible=startX>=dp(24)&&startX<=getResources().getDisplayMetrics().widthPixels-dp(24)&&row>=getHeaderViewsCount()&&row<getCount()-getFooterViewsCount();}
+      float dx=event.getRawX()-startX,dy=event.getRawY()-startY;
+      if(action==MotionEvent.ACTION_MOVE&&eligible&&!horizontal&&!vertical){
+        if(Math.abs(dy)>slop&&Math.abs(dy)*1.5f>=Math.abs(dx))vertical=true;
+        else if(Math.abs(dx)>slop&&Math.abs(dx)>Math.abs(dy)*1.5f){horizontal=true;
+          MotionEvent cancel=MotionEvent.obtain(event);cancel.setAction(MotionEvent.ACTION_CANCEL);super.dispatchTouchEvent(cancel);cancel.recycle();}
+      }
+      if(horizontal){
+        if(action==MotionEvent.ACTION_UP){float density=getResources().getDisplayMetrics().density;
+          int direction=UiState.swipePage(dx/density,dy/density,startX/density,getResources().getDisplayMetrics().widthPixels/density);
+          horizontal=false;if(direction!=0)flipConversations(direction);}
+        else if(action==MotionEvent.ACTION_CANCEL)horizontal=false;
+        return true;
+      }
+      return super.dispatchTouchEvent(event);
+    }
   }
   void newConversation(){
     if(!shared()&&running()){hint("请等当前任务结束，或返回后停止任务");return;}
@@ -428,16 +506,20 @@ public class AssistantActivity extends MainActivity {
   }
 
   void exchange(Work work,Consumer<JSONObject> done){
+    exchange(work,done,null);
+  }
+  void exchange(Work work,Consumer<JSONObject> done,Consumer<Exception> failed){
     if(busy){hint("正在提交，请稍候");return;}
     busy=true;if(sendButton!=null)sendButton.setEnabled(false);
     controls.execute(()->{
-      JSONObject value=null;String error=null;
-      try{value=decode(work.run());}catch(Exception e){error=e.getMessage()==null?"连接失败":e.getMessage();}
-      final JSONObject result=value;final String failure=error;
+      JSONObject value=null;Exception error=null;
+      try{value=decode(work.run());}catch(Exception e){error=e;}
+      final JSONObject result=value;final Exception failure=error;
       runOnUiThread(()->{
         busy=false;
-        if(failure!=null){if(!isDestroyed()){
-          hint("未确认送达："+failure.substring(0,Math.min(failure.length(),140)));
+        if(failure!=null){if(failed!=null)failed.accept(failure);if(!isDestroyed()){
+          String message=failure.getMessage()==null?"连接失败":failure.getMessage();
+          hint((failure instanceof RequestFailure&&((RequestFailure)failure).notApplied?"未执行：":"未确认送达：")+message.substring(0,Math.min(message.length(),140)));
           for(JSONObject row:rows)if(" · 发送中".equals(row.optString("delivery")))try{row.put("delivery"," · 未确认送达");}catch(JSONException ignored){}
           if(adapter!=null)adapter.notifyDataSetChanged();
         }}
@@ -497,10 +579,17 @@ public class AssistantActivity extends MainActivity {
   }
   void showPending(JSONObject item){
     final String thread=current.optString("thread_id"),turn=current.optString("turn_id"),id=item.optString("id");
+    final String version=item.optString("version");
     pendingPanel.addView(label(current.optString("title",viewTitle),12));
     TextView question=label(item.optString("summary","需要你决定"),16);question.setTextColor(0xFFFFCC75);pendingPanel.addView(question);
-    if(item.optString("kind").equals("manual")){
-      pendingPanel.addView(label("此类操作请在电脑处理",15));
+    if(item.optString("kind").equals("manual")||!item.optBoolean("supported",true)){
+      if(!item.optString("detail").isEmpty())addControl(pendingPanel,control(item.optString("kind").equals("plan")?"查看计划全文":"查看详情",false,()->showPages("详情",item.optString("detail"))));
+      pendingPanel.addView(label(item.optString("unavailable_reason","此类操作请在电脑处理"),15));
+      if(item.optString("kind").equals("plan")){
+        Button execute=control("执行此计划 · 需电脑",false,()->{});execute.setEnabled(false);addControl(pendingPanel,execute);
+        Button modify=control("提出修改 · 需电脑",false,()->{});modify.setEnabled(false);addControl(pendingPanel,modify);
+      }
+      addControl(pendingPanel,control("在电脑打开此对话",false,()->openOnDesktop(thread)));
     }else if(item.optString("kind").equals("approval")){
       addControl(pendingPanel,control("查看操作详情",false,()->showPages("操作详情",item.optString("detail"))));
       JSONArray decisions=item.optJSONArray("decisions");
@@ -508,12 +597,17 @@ public class AssistantActivity extends MainActivity {
         for(int n=0;n<decisions.length();n++){
           JSONObject option=decisions.optJSONObject(n);if(option==null)continue;
           String decision=option.optString("value");
-          addControl(pendingPanel,control(option.optString("label"),decision.equals("accept"),()->answer(id,decision,null,thread,turn)));
+          if(!option.optString("detail").isEmpty())addControl(pendingPanel,control("查看规则详情",false,()->showPages("规则详情",option.optString("detail"))));
+          addControl(pendingPanel,control(option.optString("label"),decision.equals("accept"),()->answer(id,decision,null,null,thread,turn,version)));
         }
       }else{
-        addControl(pendingPanel,control("仅本次允许",true,()->answer(id,"accept",null,thread,turn)));
-        addControl(pendingPanel,control("拒绝",false,()->answer(id,"decline",null,thread,turn)));
+        addControl(pendingPanel,control("仅本次允许",true,()->answer(id,"accept",null,null,thread,turn,version)));
+        addControl(pendingPanel,control("拒绝",false,()->answer(id,"decline",null,null,thread,turn,version)));
       }
+    }else if(item.optString("kind").equals("permissions")){
+      showPermissionFields(item,id,thread,turn,version);
+    }else if(item.optString("kind").equals("form")){
+      showFormFields(item,id,thread,turn,version);
     }else{
       JSONArray questions=item.optJSONArray("questions");Map<String,EditText> values=new LinkedHashMap<>();
       if(questions==null)return;
@@ -534,18 +628,112 @@ public class AssistantActivity extends MainActivity {
         JSONObject answers=new JSONObject();
         try{for(String name:values.keySet()){String text=UiState.answerText(values.get(name).getText().toString());
           if(text==null){hint("请回答全部问题");return;}answers.put(name,text);}
-          answer(id,null,answers,thread,turn);
+          answer(id,null,answers,null,thread,turn,version);
         }catch(Exception e){hint("请检查回答");}
       }));
     }
   }
-  void answer(String id,String decision,JSONObject answers,String thread,String turn){
+  void answer(String id,String decision,JSONObject answers,JSONObject response,String thread,String turn,String version){
     if(voiceWorking){hint("请先结束录音");return;}
     try{
       JSONObject body=new JSONObject();body.put("id",id);body.put("thread_id",thread);body.put("turn_id",turn);
       if(decision!=null)body.put("decision",decision);if(answers!=null)body.put("answers",answers);
+      if(response!=null)body.put("response",response);if(!version.isEmpty())body.put("expected_version",version);
       exchange(()->request(endpoint("/assistant/answer"),"POST",body.toString(),get("token")),state->{applyState(state);hint("请求已处理");});
     }catch(Exception e){hint("回答未发送");}
+  }
+  void openOnDesktop(String target){
+    try{JSONObject body=new JSONObject().put("thread_id",target);
+      exchange(()->request(endpoint("/assistant/conversations/open"),"POST",body.toString(),get("token")),result->hint("已在电脑打开对应对话"));
+    }catch(JSONException e){hint("缺少对应对话，请刷新");}
+  }
+  CheckBox decisionCheck(String text,LinearLayout parent){
+    CheckBox box=new CheckBox(this);box.setText(text);box.setTextColor(WHITE);box.setTextSize(14);box.setMinHeight(dp(48));
+    parent.addView(box,new LinearLayout.LayoutParams(-1,-2));return box;
+  }
+  EditText decisionInput(LinearLayout parent,String hint){
+    EditText input=new EditText(this);input.setTextColor(WHITE);input.setHintTextColor(MUTED);input.setTextSize(15);input.setHint(hint);input.setMinHeight(dp(48));
+    parent.addView(input,new LinearLayout.LayoutParams(-1,-2));return input;
+  }
+  void showPermissionFields(JSONObject item,String id,String thread,String turn,String version){
+    JSONObject asked=item.optJSONObject("permissions");if(asked==null)return;
+    addControl(pendingPanel,control("查看申请范围",false,()->showPages("申请范围",item.optString("detail"))));
+    LinkedHashMap<String,CheckBox> picks=new LinkedHashMap<>();
+    JSONObject network=asked.optJSONObject("network");
+    if(network!=null)picks.put("network",decisionCheck("允许网络访问",pendingPanel));
+    JSONObject fs=asked.optJSONObject("fileSystem");
+    if(fs!=null)for(String kind:new String[]{"read","write","entries"}){
+      JSONArray paths=fs.optJSONArray(kind);if(paths==null)continue;
+      for(int n=0;n<paths.length();n++)picks.put(kind+":"+n,decisionCheck((kind.equals("read")?"读取：":kind.equals("write")?"写入：":"访问项：")+paths.opt(n),pendingPanel));
+    }
+    CheckBox session=decisionCheck("在本次对话后续也允许",pendingPanel);
+    addControl(pendingPanel,control("允许所选范围",true,()->{
+      try{
+        JSONObject granted=new JSONObject(),selectedFs=new JSONObject();
+        if(picks.containsKey("network")&&picks.get("network").isChecked())granted.put("network",network);
+        if(fs!=null)for(String kind:new String[]{"read","write","entries"}){
+          JSONArray paths=fs.optJSONArray(kind),selected=new JSONArray();if(paths==null)continue;
+          for(int n=0;n<paths.length();n++)if(picks.get(kind+":"+n).isChecked())selected.put(paths.get(n));
+          if(selected.length()>0)selectedFs.put(kind,selected);
+        }
+        if(selectedFs.length()>0){if(fs.has("globScanMaxDepth"))selectedFs.put("globScanMaxDepth",fs.get("globScanMaxDepth"));granted.put("fileSystem",selectedFs);}
+        if(granted.length()==0){hint("请选择需要允许的范围，或点拒绝");return;}
+        JSONObject response=new JSONObject().put("permissions",granted).put("scope",session.isChecked()?"session":"turn");
+        answer(id,null,null,response,thread,turn,version);
+      }catch(Exception e){hint("请检查授权范围");}
+    }));
+    addControl(pendingPanel,control("拒绝",false,()->{
+      try{answer(id,null,null,new JSONObject().put("permissions",new JSONObject()).put("scope","turn"),thread,turn,version);}catch(JSONException ignored){}
+    }));
+  }
+  void showFormFields(JSONObject item,String id,String thread,String turn,String version){
+    JSONArray fields=item.optJSONArray("fields");if(fields==null)return;
+    Map<String,EditText> inputs=new LinkedHashMap<>();Map<String,CheckBox> checks=new LinkedHashMap<>(),optional=new LinkedHashMap<>();
+    Map<String,List<CheckBox>> multi=new LinkedHashMap<>();
+    for(int n=0;n<fields.length();n++){
+      JSONObject f=fields.optJSONObject(n);if(f==null)continue;String key=f.optString("id"),type=f.optString("type");
+      pendingPanel.addView(label(f.optString("title",key)+(f.optBoolean("required")?" *":"（可选）"),15));
+      if(!f.optString("description").isEmpty())pendingPanel.addView(label(f.optString("description"),12));
+      if(!f.optBoolean("required"))optional.put(key,decisionCheck("填写此项",pendingPanel));
+      JSONArray choices=f.optJSONArray("enum"),names=f.optJSONArray("enumNames");
+      if(type.equals("boolean")){CheckBox box=decisionCheck("是／启用",pendingPanel);box.setChecked(f.optBoolean("default",false));checks.put(key,box);}
+      else if(type.equals("array")){
+        List<CheckBox> boxes=new ArrayList<>();
+        if(choices!=null)for(int c=0;c<choices.length();c++)boxes.add(decisionCheck(names==null?choices.optString(c):names.optString(c,choices.optString(c)),pendingPanel));
+        multi.put(key,boxes);
+      }else{
+        EditText input=decisionInput(pendingPanel,type.equals("string")?"请输入回答":"请输入数字");inputs.put(key,input);
+        if(!type.equals("string"))input.setInputType(InputType.TYPE_CLASS_NUMBER|InputType.TYPE_NUMBER_FLAG_SIGNED|(type.equals("number")?InputType.TYPE_NUMBER_FLAG_DECIMAL:0));
+        if(f.has("default")&&!f.isNull("default"))input.setText(f.optString("default"));
+        if(choices!=null)for(int c=0;c<choices.length();c++){
+          final String value=choices.optString(c),name=names==null?value:names.optString(c,value);
+          addControl(pendingPanel,control(name,false,()->{input.setText(value);input.clearFocus();}));
+        }
+      }
+    }
+    addControl(pendingPanel,control("提交表单",true,()->{
+      try{
+        JSONObject content=new JSONObject();
+        for(int n=0;n<fields.length();n++){
+          JSONObject f=fields.getJSONObject(n);String key=f.getString("id"),type=f.getString("type");
+          if(optional.containsKey(key)&&!optional.get(key).isChecked())continue;
+          if(type.equals("boolean"))content.put(key,checks.get(key).isChecked());
+          else if(type.equals("array")){
+            JSONArray selected=new JSONArray(),choices=f.getJSONArray("enum");List<CheckBox> boxes=multi.get(key);
+            for(int c=0;c<boxes.size();c++)if(boxes.get(c).isChecked())selected.put(choices.get(c));content.put(key,selected);
+          }else{
+            String text=inputs.get(key).getText().toString();
+            if(type.equals("integer"))content.put(key,Long.parseLong(text));
+            else if(type.equals("number")){double value=Double.parseDouble(text);if(Double.isNaN(value)||Double.isInfinite(value))throw new NumberFormatException();content.put(key,value);}
+            else content.put(key,text);
+          }
+        }
+        answer(id,null,null,new JSONObject().put("action","accept").put("content",content),thread,turn,version);
+      }catch(Exception e){hint("请检查必填项与数字格式");}
+    }));
+    for(String action:new String[]{"decline","cancel"})addControl(pendingPanel,control(action.equals("decline")?"拒绝":"取消",false,()->{
+      try{answer(id,null,null,new JSONObject().put("action",action).put("content",JSONObject.NULL),thread,turn,version);}catch(JSONException ignored){}
+    }));
   }
   void refresh(){
     AssistantMonitor.reconnectSoon();
@@ -564,7 +752,7 @@ public class AssistantActivity extends MainActivity {
   }
   void menu(){
     if(voiceWorking){hint("请先结束录音并等待识别完成");return;}
-    showDialog(new AlertDialog.Builder(this).setTitle("更多操作").setItems(new String[]{"刷新连接与记录","返回执行中的对话","停止当前任务","电脑控制","设置与提醒"},(d,n)->{
+    showDialog(new AlertDialog.Builder(this).setTitle("更多操作").setItems(new String[]{"刷新连接与记录","返回执行中的对话","停止当前任务","电脑控制","设置与提醒","当前对话设置","对话管理"},(d,n)->{
       if(n==0)refresh();if(n==1)returnToActive();
       if(n==2){
         if(!viewingActive()||!running()){hint("请先返回执行中的对话");return;}
@@ -575,7 +763,119 @@ public class AssistantActivity extends MainActivity {
       }
       if(n==3)startActivity(new Intent(this,MainActivity.class).putExtra("controls",true));
       if(n==4)reminderSettings();
+      if(n==5)threadSettings();
+      if(n==6){if(isNew()||viewed.isEmpty())openList(true);else conversationManagement(viewed,false);}
     }).create());
+  }
+  ScrollView boundedPanel(LinearLayout panel){
+    ScrollView scroll=new ScrollView(this){
+      @Override protected void onMeasure(int w,int h){super.onMeasure(w,View.MeasureSpec.makeMeasureSpec(getResources().getDisplayMetrics().heightPixels/2,View.MeasureSpec.AT_MOST));}
+    };
+    scroll.addView(panel);return scroll;
+  }
+  Spinner choiceSpinner(LinearLayout parent,List<String> names){
+    Spinner choice=new Spinner(this);choice.setMinimumHeight(dp(48));
+    ArrayAdapter<String> adapter=new ArrayAdapter<String>(this,android.R.layout.simple_spinner_item,names){
+      @Override public View getView(int position,View reusable,ViewGroup holder){View view=super.getView(position,reusable,holder);((TextView)view).setTextColor(WHITE);return view;}
+    };
+    adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);choice.setAdapter(adapter);
+    parent.addView(choice,new LinearLayout.LayoutParams(-1,dp(48)));return choice;
+  }
+  void threadSettings(){
+    if(isNew()||viewed.isEmpty()){hint("第一条消息创建对话后，可查看此对话设置");return;}
+    final String target=viewed;final int epoch=navigation;hint("正在读取当前对话设置…");
+    query(()->readRequest(url("/assistant/conversations/settings?thread_id="+enc(target))),epoch,this::showThreadSettings);
+  }
+  void showThreadSettings(JSONObject data){
+    final String target=data.optString("thread_id"),version=data.optString("version");
+    JSONArray models=data.optJSONArray("models"),modes=data.optJSONArray("modes");
+    if(models==null)models=new JSONArray();if(modes==null)modes=new JSONArray();
+    final JSONArray modelItems=models,modeItems=modes;
+    LinearLayout panel=new LinearLayout(this);panel.setOrientation(LinearLayout.VERTICAL);
+    panel.addView(label("仅此对话，与电脑同步",12));
+    String previous=get("operation:"+target+":settings");
+    if(!previous.isEmpty())try{
+      JSONObject old=new JSONObject(previous),changes=old.optJSONObject("changes");boolean matches=changes!=null;
+      if(changes!=null)for(Iterator<String> it=changes.keys();it.hasNext();){String k=it.next();if(!String.valueOf(changes.opt(k)).equals(String.valueOf(data.opt(k))))matches=false;}
+      if(matches)prefs.edit().remove("operation:"+target+":settings").apply();
+    }catch(JSONException ignored){}
+    panel.addView(label("模型",14));List<String> modelNames=new ArrayList<>();int modelIndex=-1;
+    for(int n=0;n<modelItems.length();n++){JSONObject m=modelItems.optJSONObject(n);if(m==null)continue;modelNames.add(m.optString("name",m.optString("id")));if(m.optString("id").equals(data.optString("model")))modelIndex=n;}
+    if(modelNames.isEmpty())modelNames.add(data.optString("model","未获取"));
+    Spinner model=choiceSpinner(panel,modelNames);model.setSelection(Math.max(0,modelIndex));
+    panel.addView(label("思考强度",14));List<String> effortNames=new ArrayList<>(),effortValues=new ArrayList<>();Spinner effort=choiceSpinner(panel,effortNames);
+    Runnable fillEfforts=()->{
+      effortNames.clear();effortValues.clear();effortNames.add("保持当前设置");JSONObject m=modelItems.optJSONObject(model.getSelectedItemPosition());JSONArray values=m==null?null:m.optJSONArray("efforts");
+      if(values!=null)for(int n=0;n<values.length();n++){String value=values.optString(n);effortNames.add(value);effortValues.add(value);}
+      int index=UiState.effortIndex(data.isNull("effort")?null:data.optString("effort"),effortValues.toArray(new String[0]));
+      ((ArrayAdapter<?>)effort.getAdapter()).notifyDataSetChanged();effort.setSelection(index);
+    };fillEfforts.run();
+    model.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener(){public void onItemSelected(AdapterView<?> p,View v,int n,long id){fillEfforts.run();}public void onNothingSelected(AdapterView<?> p){}});
+    panel.addView(label("工作模式",14));List<String> modeNames=new ArrayList<>();int modeIndex=0;
+    for(int n=0;n<modeItems.length();n++){String mode=modeItems.optString(n);modeNames.add(mode.equals("plan")?"规划模式":"执行模式");if(mode.equals(data.optString("mode")))modeIndex=n;}
+    if(modeNames.isEmpty())modeNames.add(data.optString("mode","未获取"));
+    Spinner mode=choiceSpinner(panel,modeNames);mode.setSelection(modeIndex);
+    boolean writable=data.optBoolean("can_save")&&modelIndex>=0&&modeItems.length()>0;
+    model.setEnabled(writable);effort.setEnabled(writable);mode.setEnabled(writable);
+    if(!writable)panel.addView(label(data.optString("unavailable_reason","当前模型未出现在可选目录，请回电脑设置"),14));
+    AlertDialog dialog=new AlertDialog.Builder(this).setTitle("当前对话设置").setView(boundedPanel(panel)).setPositiveButton("保存",null).setNegativeButton("关闭",null).create();showDialog(dialog);
+    dialog.getButton(-1).setEnabled(writable);
+    dialog.getButton(-1).setOnClickListener(v->{
+      try{
+        JSONObject changes=new JSONObject();JSONObject selected=modelItems.getJSONObject(model.getSelectedItemPosition());
+        String selectedModel=selected.getString("id"),selectedMode=modeItems.getString(mode.getSelectedItemPosition());
+        String selectedEffort=UiState.effortValue(effort.getSelectedItemPosition(),effortValues.toArray(new String[0]));
+        if(!selectedModel.equals(data.optString("model")))changes.put("model",selectedModel);
+        if(selectedEffort!=null&&!selectedEffort.equals(data.optString("effort")))changes.put("effort",selectedEffort);
+        if(!selectedMode.equals(data.optString("mode")))changes.put("mode",selectedMode);
+        if(changes.length()==0){dialog.dismiss();hint("设置没有变化");return;}
+        JSONObject body=new JSONObject().put("thread_id",target).put("expected_version",version).put("changes",changes);
+        postThreadOperation("/assistant/conversations/settings",body,target,"settings",result->{dialog.dismiss();hint(result.optBoolean("synchronizing")?"电脑已接收，等待设置同步":"当前对话设置已保存");});
+      }catch(Exception e){hint("请重新选择电脑提供的设置");}
+    });
+  }
+  void postThreadOperation(String path,JSONObject body,String target,String action,Consumer<JSONObject> done){
+    if(busy){hint("正在提交，请稍候");return;}
+    final String key="operation:"+target+":"+action;
+    try{
+      String saved=get(key);JSONObject payload=body;
+      if(!saved.isEmpty()){
+        JSONObject previous=new JSONObject(saved);String operation=previous.optString("operation_id");previous.remove("operation_id");
+        if(!previous.toString().equals(body.toString())){hint("上次操作送达尚未确认，请先在电脑核对并刷新");return;}
+        payload.put("operation_id",operation);
+      }else payload.put("operation_id",UUID.randomUUID().toString());
+      final String json=payload.toString();prefs.edit().putString(key,json).apply();
+      exchange(()->request(endpoint(path),"POST",json,get("token")),result->{prefs.edit().remove(key).apply();done.accept(result);},error->{
+        if(error instanceof RequestFailure&&((RequestFailure)error).notApplied)prefs.edit().remove(key).apply();
+      });
+    }catch(Exception e){hint("操作尚未发送，请刷新后重试");}
+  }
+  void conversationManagement(String target,boolean archived){
+    final int epoch=navigation;hint("正在读取对话管理信息…");
+    query(()->readRequest(url("/assistant/conversations/manage?thread_id="+enc(target))),epoch,data->{
+      String title=data.optString("title","对话");JSONObject capabilities=data.optJSONObject("capabilities");
+      String[] options=archived?new String[]{"恢复此对话","返回最近对话"}:new String[]{"重命名","归档此对话","已归档对话"};
+      showDialog(new AlertDialog.Builder(this).setTitle(title).setItems(options,(dialog,index)->{
+        if(archived&&index==1){openList();return;}if(!archived&&index==2){openList(true);return;}
+        String action=archived?"restore":index==0?"rename":"archive";
+        JSONObject cap=capabilities==null?null:capabilities.optJSONObject(action);
+        if(cap==null||!cap.optBoolean("available")){showPages("暂不可用",cap==null?"电脑服务尚未提供此操作":cap.optString("reason","请回电脑处理"));return;}
+        if(action.equals("rename")){
+          LinearLayout panel=new LinearLayout(this);panel.setOrientation(LinearLayout.VERTICAL);EditText name=decisionInput(panel,"对话名称");name.setText(title);
+          AlertDialog rename=new AlertDialog.Builder(this).setTitle("重命名").setView(boundedPanel(panel)).setPositiveButton("保存",null).setNegativeButton("取消",null).create();showDialog(rename);
+          rename.getButton(-1).setOnClickListener(v->{String value=name.getText().toString().trim();if(value.isEmpty()||value.length()>120){hint("名称应为1到120个字符");return;}
+            submitManagement(data,action,value,false,result->{rename.dismiss();if(viewed.equals(target)){viewTitle=result.optString("title",value);persistView();if(!listMode)setText(titleBar,viewTitle+" ▾");}hint("名称已更新");});});
+        }else if(action.equals("archive"))confirm("归档这段对话？记录会保留，可在已归档列表恢复。",()->submitManagement(data,action,null,true,result->{openList();hint("对话已归档");}));
+        else submitManagement(data,action,null,false,result->{openList(true);hint("对话已恢复，可在最近对话中继续");});
+      }).create());
+    });
+  }
+  void submitManagement(JSONObject info,String action,String name,boolean confirmed,Consumer<JSONObject> done){
+    try{
+      String target=info.getString("thread_id");JSONObject body=new JSONObject().put("thread_id",target).put("action",action).put("expected_version",info.getString("version"));
+      if(name!=null)body.put("name",name);if(confirmed)body.put("confirmed",true);
+      postThreadOperation("/assistant/conversations/manage",body,target,action,done);
+    }catch(JSONException e){hint("对话信息已变化，请刷新");}
   }
   void reminderSettings(){
     boolean reminders=connectionState.optBoolean("desktop_attention_enabled",true)&&!prefs.getBoolean("desktopLocalMute",false);
