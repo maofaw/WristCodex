@@ -53,6 +53,12 @@ public class AssistantActivity extends MainActivity {
   String measuredRequest="",measuredTurn="";
   boolean dragging;
   VoiceCapture capture=new VoiceCapture();
+  CloudSpeech cloudSpeech;
+  int cloudEpoch;
+  VoiceDraft cloudDraft;
+  String cloudPending="";
+  boolean cloudRenderScheduled;
+  Runnable cloudRender=()->{cloudRenderScheduled=false;renderCloudPreview();};
   Runnable saveDraft=()->saveDraft();
   Runnable showLatestPreview=()->{if(active&&!isDestroyed())updatePreview();};
   BroadcastReceiver receiver=new BroadcastReceiver(){public void onReceive(Context c,Intent i){applyState(AssistantMonitor.latest);}};
@@ -247,9 +253,10 @@ public class AssistantActivity extends MainActivity {
     boolean blocked=!shared()&&running()&&!viewingActive();
     boolean cannotSteer=shared()&&running()&&!current.optBoolean("can_steer");
     boolean cannotSend=!canSubmit();
-    composer.setVisibility(readOnly||item!=null||blocked?View.GONE:View.VISIBLE);
+    boolean cloudRecording=cloudDraft!=null;
+    composer.setVisibility(!cloudRecording&&(readOnly||item!=null||blocked)?View.GONE:View.VISIBLE);
     sendButton.setEnabled(!busy&&!blocked&&!cannotSend);sendButton.setAlpha(busy||blocked||cannotSend?0.45f:1f);
-    mic.setEnabled(!blocked);
+    mic.setEnabled(cloudRecording||!blocked);
     boolean activation=shared()&&readOnly&&!viewed.isEmpty()&&!isNew()&&connectionState.optBoolean("desktop_connected");
     boolean returnLink=!shared()&&(blocked||readOnly)&&!current.optString("thread_id").isEmpty();
     status.setClickable(returnLink||activation);status.setMinimumHeight(returnLink||activation?dp(48):0);status.setTextColor(returnLink||activation?GREEN:MUTED);
@@ -759,6 +766,7 @@ public class AssistantActivity extends MainActivity {
     });
   }
   void returnToActive(){
+    if(voiceWorking){hint("请先结束录音并等待识别完成");return;}
     String target=current.optString("thread_id");if(target.isEmpty()){hint("还没有执行中的对话");return;}
     saveDraft();viewed=target;viewTitle=current.optString("title","手表对话");readOnly=false;persistView();showChat(true);
   }
@@ -893,10 +901,11 @@ public class AssistantActivity extends MainActivity {
     boolean reminders=connectionState.optBoolean("desktop_attention_enabled",true)&&!prefs.getBoolean("desktopLocalMute",false);
     showDialog(new AlertDialog.Builder(this).setTitle("设置与提醒").setItems(new String[]{
       "电脑确认提醒："+(reminders?"开":"关"),"自动弹出确认："+(android.provider.Settings.canDrawOverlays(this)?"已授权":"待授权"),
-      "暂停全部主动提醒","连接设置","自定义接口"},(d,n)->{
+      "暂停全部主动提醒","连接设置","自定义接口","语音输入："+(get("voiceProvider").equals("doubao")?"豆包云端":"电脑本地")},(d,n)->{
       if(n==0)toggleDesktopReminders(!reminders);if(n==1)configureAttentionPopup();
       if(n==2){stopService(new Intent(this,AssistantMonitor.class));hint("提醒已暂停，下次打开助手时恢复");}
       if(n==3||n==4)startActivity(new Intent(this,MainActivity.class).putExtra("screen",n==3?"connection":"custom"));
+      if(n==5)cloudVoiceSettings();
     }).create());
   }
   void configureAttentionPopup(){
@@ -1004,7 +1013,9 @@ public class AssistantActivity extends MainActivity {
     dialog.getButton(-3).setOnClickListener(v->{index[0]++;update.run();});update.run();
   }
   void beginSpeech(){
+    if(cloudSpeech!=null){beginCloudSpeech();return;}
     if(listMode||readOnly||(running()&&!viewingActive())){hint("请先返回可发送的当前对话");return;}
+    if(get("voiceProvider").equals("doubao")){beginCloudSpeech();return;}
     final String speechTarget=viewed;
     if(capture.recording){capture.stop();mic.setText("正在识别…");hint("正在电脑上识别，返回键和滑动仍可使用");return;}
     if(voiceWorking||busy){hint("正在处理，请稍候");return;}
@@ -1034,6 +1045,95 @@ public class AssistantActivity extends MainActivity {
       });
     }),error->runOnUiThread(()->{if(!isDestroyed()){voiceWorking=false;mic.setText("点一下说话");if(active)hint("录音失败，请重试");}}));
   }
+  void cloudVoiceSettings(){
+    if(voiceWorking){hint("请先结束录音");return;}
+    LinearLayout form=new LinearLayout(this);form.setOrientation(LinearLayout.VERTICAL);form.setPadding(dp(12),dp(4),dp(12),dp(4));
+    Spinner provider=choiceSpinner(form,Arrays.asList("电脑本地识别","豆包云端 · 边说边出字"));
+    provider.setSelection(get("voiceProvider").equals("doubao")?1:0);
+    CloudVoiceKey saved=new CloudVoiceKey(this);
+    form.addView(label("云端语音直接从手表上传火山引擎，不经电脑；需开通流式语音识别 2.0，可能产生调用费用。",13));
+    EditText key=new EditText(this);key.setTextColor(WHITE);key.setHintTextColor(MUTED);key.setMinHeight(dp(48));
+    key.setInputType(InputType.TYPE_CLASS_TEXT|InputType.TYPE_TEXT_VARIATION_PASSWORD);key.setSingleLine(true);
+    key.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+    key.setHint(saved.saved()?"密钥已保存；留空保持原值":"填入语音服务 API Key");form.addView(key);
+    form.addView(label("仅在此手表加密保存，不回显密钥；识别结果由你检查后发送。",12));
+    AlertDialog dialog=showDialog(new AlertDialog.Builder(this).setTitle("语音输入").setView(boundedPanel(form))
+      .setPositiveButton("保存",null).setNegativeButton("返回",null)
+      .setNeutralButton("清除密钥",(d,w)->speech.execute(()->{
+        try{saved.clear();prefs.edit().putString("voiceProvider","desktop").apply();runOnUiThread(()->hint("云端密钥已清除，恢复电脑本地识别"));}
+        catch(Exception e){runOnUiThread(()->hint("清除未完成，请重试"));}
+      })).create());
+    dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v->{
+      final boolean cloud=provider.getSelectedItemPosition()==1;final String value=key.getText().toString().trim();
+      if(cloud&&!saved.saved()&&value.isEmpty()){hint("请先填写语音 API Key");return;}
+      if(!value.isEmpty()&&(value.length()<16||!CloudProtocol.validKey(value))){hint("请检查语音 API Key 格式");return;}
+      dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+      speech.execute(()->{
+        try{if(!value.isEmpty())saved.save(value);prefs.edit().putString("voiceProvider",cloud?"doubao":"desktop").apply();
+          runOnUiThread(()->{if(!isDestroyed())dialog.dismiss();hint(cloud?"已启用手表直连云端流式语音":"已切换电脑本地识别");});
+        }catch(Exception e){runOnUiThread(()->{if(!isDestroyed())dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);hint("密钥未保存，请重试");});}
+      });
+    });
+  }
+  void beginCloudSpeech(){
+    if(cloudSpeech!=null){cloudSpeech.stop();mic.setText("正在收尾…");hint("等待最后的识别文字；不会自动发送");return;}
+    if(voiceWorking||busy){hint("正在处理，请稍候");return;}
+    if(!new CloudVoiceKey(this).saved()){cloudVoiceSettings();return;}
+    if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},7);return;}
+    final int epoch=++cloudEpoch;final String target=viewed;
+    cloudDraft=new VoiceDraft(prompt.getText().toString(),target);cloudPending="";
+    voiceWorking=true;discardCapture=false;prompt.setEnabled(false);mic.setText("连接云端…");hint("正在连接语音服务；不经过电脑");
+    ((InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).hideSoftInputFromWindow(prompt.getWindowToken(),0);
+    speech.execute(()->{
+      String apiKey;
+      try{apiKey=new CloudVoiceKey(this).load();if(apiKey.isEmpty())throw new IOException();}
+      catch(Exception e){runOnUiThread(()->cloudFinished(epoch,"无法读取云端密钥，请在语音设置中重新保存"));return;}
+      runOnUiThread(()->{
+        if(!active||isDestroyed()||epoch!=cloudEpoch||!target.equals(viewed))return;
+        CloudSpeech.Audio audio=new CloudSpeech.Audio(){
+          public void start(Consumer<byte[]> frame,Runnable ended,Consumer<String> error){capture.startStreaming(frame,ended,error);}
+          public void stop(){capture.stop();}
+        };
+        cloudSpeech=new CloudSpeech(apiKey,audio,new CloudSpeech.Listener(){
+          public void ready(){runOnUiThread(()->{if(epoch==cloudEpoch&&active){mic.setText("正在听 · 点此结束");hint("边说边出字 · 最长 30 秒");}});}
+          public void response(String json,boolean last){
+            String text;
+            try{
+              JSONObject value=new JSONObject(json);int code=value.optInt("code",0);
+              if(code!=0&&code!=1000&&code!=20000000)throw new IOException();
+              JSONObject result=value.optJSONObject("result");text=result==null?"":result.optString("text");
+              if(text.length()>4000)throw new IOException();
+            }catch(Exception e){runOnUiThread(()->cloudFinished(epoch,"云端返回异常，已保留文字"));return;}
+            final String recognized=text;
+            runOnUiThread(()->{if(epoch!=cloudEpoch||!active||!target.equals(viewed))return;
+              if(!recognized.isEmpty())cloudPending=recognized;
+              if(last)renderCloudPreview();else if(!cloudRenderScheduled){cloudRenderScheduled=true;ui.postDelayed(cloudRender,250);}
+            });
+          }
+          public void done(){runOnUiThread(()->cloudFinished(epoch,"已识别，请检查文字再发送"));}
+          public void error(String reason){runOnUiThread(()->cloudFinished(epoch,reason));}
+        });
+        cloudSpeech.start();
+      });
+    });
+  }
+  void renderCloudPreview(){
+    if(cloudDraft==null||prompt==null)return;
+    String text=cloudDraft.updateFor(viewed,cloudPending);if(text==null)return;
+    if(!prompt.getText().toString().equals(text)){prompt.setText(text);prompt.setSelection(text.length());}
+  }
+  void cloudFinished(int epoch,String message){
+    if(epoch!=cloudEpoch)return;
+    if(message.equals("已识别，请检查文字再发送")&&cloudPending.isEmpty())message="没有识别到文字，请重试；原草稿已保留";
+    renderCloudPreview();cancelCloudVoice();saveDraft();if(active&&!isDestroyed())hint(message);
+  }
+  void cancelCloudVoice(){
+    if(cloudDraft==null&&cloudSpeech==null)return;
+    renderCloudPreview();cloudEpoch++;ui.removeCallbacks(cloudRender);cloudRenderScheduled=false;
+    CloudSpeech old=cloudSpeech;cloudSpeech=null;if(old!=null)old.cancel();
+    cloudDraft=null;cloudPending="";voiceWorking=false;
+    if(prompt!=null)prompt.setEnabled(true);if(mic!=null)mic.setText("点一下说话");
+  }
   String upload(byte[] audio)throws Exception{
     try{
       HttpURLConnection c=(HttpURLConnection)new URL(endpoint("/assistant/voice")).openConnection();
@@ -1058,7 +1158,7 @@ public class AssistantActivity extends MainActivity {
     if(intent.getBooleanExtra("inbox",false)){openAttention("");return;}
     String target=intent.getStringExtra("thread_id");if(target==null||target.isEmpty())target=current.optString("thread_id");
     if(!target.isEmpty()&&(!target.equals(viewed)||listMode)){
-      discardCapture=true;capture.stop();voiceWorking=false;saveDraft();
+      cancelCloudVoice();discardCapture=true;capture.stop();voiceWorking=false;saveDraft();
       viewed=target;viewTitle=target.equals(current.optString("thread_id"))?current.optString("title","手表对话"):"手表对话";
       readOnly=false;persistView();showChat(true);
     }
@@ -1075,6 +1175,7 @@ public class AssistantActivity extends MainActivity {
     resumeHistoryThread="";
   }
   @Override protected void onPause(){
+    cancelCloudVoice();
     if(!listMode&&loadingHistory){resumeHistoryThread=viewed;resumeHistoryOlder=historyReadOlder;resumeHistoryAutomatic=historyReadAutomatic;}
     active=false;ui.removeCallbacks(showLatestPreview);navigation++;loadingHistory=false;historyStamp="";cancelRead();discardCapture=true;capture.stop();saveDraft();super.onPause();
   }
@@ -1084,5 +1185,5 @@ public class AssistantActivity extends MainActivity {
     super.onStop();
   }
   @Override public void onBackPressed(){if(listMode)showChat(true);else finish();}
-  @Override protected void onDestroy(){active=false;discardCapture=true;capture.stop();cancelRead();controls.shutdown();speech.shutdown();readCanceller.shutdown();ui.removeCallbacksAndMessages(null);unregisterReceiver(receiver);super.onDestroy();}
+  @Override protected void onDestroy(){cancelCloudVoice();active=false;discardCapture=true;capture.stop();cancelRead();controls.shutdown();speech.shutdown();readCanceller.shutdown();ui.removeCallbacksAndMessages(null);unregisterReceiver(receiver);super.onDestroy();}
 }

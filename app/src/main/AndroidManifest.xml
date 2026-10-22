@@ -11,7 +11,9 @@
   <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
   <application
-    android:label="腕上遥控"
+    android:label="${appLabel}"
+    android:icon="@mipmap/ic_launcher"
+    android:roundIcon="@mipmap/ic_launcher"
     android:allowBackup="false"
     android:usesCleartextTraffic="true"
     android:theme="@android:style/Theme.Material.NoActionBar">

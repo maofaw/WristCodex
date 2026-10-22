@@ -32,7 +32,7 @@ jobs:
       - name: Build
         run: |
           chmod +x gradlew
-          ./gradlew assembleRelease lintRelease --no-daemon
+          ./gradlew assembleRelease lintRelease testDebugUnitTest --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: WristCodex-unsigned-release-apk

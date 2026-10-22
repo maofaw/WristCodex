@@ -30,4 +30,26 @@ public class VoiceCapture {
     },"voice-capture");thread.start();
   }
   public void stop(){recording=false;}
+  /** Only one 200 ms PCM buffer is retained; no complete recording is accumulated. */
+  @android.annotation.SuppressLint("MissingPermission")
+  public void startStreaming(Consumer<byte[]> frame,Runnable ended,Consumer<String> error){
+    if(recording||(thread!=null&&thread.isAlive())){error.accept("busy");return;}recording=true;
+    thread=new Thread(()->{
+      AudioRecord recorder=null;
+      try{
+        int min=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
+        recorder=new AudioRecord(MediaRecorder.AudioSource.MIC,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,Math.max(min,12800));
+        if(recorder.getState()!=AudioRecord.STATE_INITIALIZED)throw new IOException("microphone unavailable");
+        byte[] chunk=new byte[6400];int used=0,total=0;recorder.startRecording();
+        while(recording&&total<960000){
+          int n=recorder.read(chunk,used,Math.min(chunk.length-used,960000-total));
+          if(n<0)throw new IOException("recording interrupted");
+          if(n>0){used+=n;total+=n;if(used==chunk.length){frame.accept(chunk);chunk=new byte[6400];used=0;}}
+        }
+        if(used>0)frame.accept(java.util.Arrays.copyOf(chunk,used));
+        ended.run();
+      }catch(Exception e){error.accept("recording failed");}
+      finally{recording=false;if(recorder!=null){try{recorder.stop();}catch(Exception ignored){}recorder.release();}}
+    },"voice-stream-capture");thread.start();
+  }
 }
