@@ -10,6 +10,20 @@
 - [全部历史安装包](https://github.com/maofaw/WristCodex/releases)：保留 v0.1—v0.6.0、独立 QA 包和早期 v0.5.1，不覆盖旧二进制。选择安装包时同时查看对应标签源码与说明。
 - 主分支包含当前预览版源码；手表 APK 与电脑服务应使用匹配版本。已有安装尽量覆盖升级，卸载会删除手表本地配置和草稿；自行编译的签名可能无法覆盖维护者签名包。
 
+### 历史版本索引
+
+| 版本 | 下载与说明 | 配套源码 |
+|---|---|---|
+| 0.6.0-rc1 候选版 | [APK、功能边界与校验值](https://github.com/maofaw/WristCodex/releases/tag/v0.6.0-rc1) | [0.6.0-rc1](https://github.com/maofaw/WristCodex/tree/v0.6.0-rc1) |
+| 0.5.1（含早期版） | [APK 与早期包](https://github.com/maofaw/WristCodex/releases/tag/v0.5.1) | [0.5.1](https://github.com/maofaw/WristCodex/tree/v0.5.1) |
+| 0.5.0 | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.5.0) | [0.5.0](https://github.com/maofaw/WristCodex/tree/v0.5.0) |
+| 0.4.0（含 QA 包） | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.4.0) | [0.4.0](https://github.com/maofaw/WristCodex/tree/v0.4.0) |
+| 0.3.0（含 QA 包） | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.3.0) | [0.3.0](https://github.com/maofaw/WristCodex/tree/v0.3.0) |
+| 0.2.0 | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.2.0) | [0.2.0](https://github.com/maofaw/WristCodex/tree/v0.2.0) |
+| 0.1.0（含最初 OPPO 界面原型） | [APK](https://github.com/maofaw/WristCodex/releases/tag/v0.1.0) | [0.1.0](https://github.com/maofaw/WristCodex/tree/v0.1.0) |
+
+历史 QA 包使用独立包名；早期版保留原二进制。旧源码与旧 APK 通过上表对应，不表示当前版本已验证所有旧版场景。
+
 ## 已接通与限制
 
 | 功能 | 当前状态 |
