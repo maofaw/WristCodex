@@ -27,6 +27,7 @@ public class MainActivity extends Activity {
   final ExecutorService worker = Executors.newSingleThreadExecutor();
   boolean busy;
   boolean atHome;
+  int pageVersion;
   int dp(int n) { return Math.round(n * getResources().getDisplayMetrics().density); }
   GradientDrawable surface(int color,int radius) {
     GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(radius));return d;
@@ -42,6 +43,7 @@ public class MainActivity extends Activity {
   }
   String get(String key) { return prefs.getString(key, ""); }
   void page(String title) {
+    pageVersion++;
     ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true);
     scroll.setBackgroundColor(Color.BLACK);
     panel = new LinearLayout(this); panel.setOrientation(LinearLayout.VERTICAL);
@@ -99,7 +101,7 @@ public class MainActivity extends Activity {
     for(int i=1;i<=3;i++) {
       final int n=i; final String name=get("name"+n).isEmpty()?"自定义 "+n:get("name"+n);
       if(!get("url"+n).isEmpty()) button(name,()->confirm("执行「"+name+"」？",
-        ()->task(()->request(get("url"+n),get("method"+n),get("body"+n),get("bearer"+n)))));
+        ()->task(()->bridgeRequest(get("url"+n),get("method"+n),get("body"+n),get("bearer"+n)))));
     }
     button("自定义接口按钮",this::custom);
     text("Codex 在电脑执行，手表发送任务。\n家居功能需连接相应服务。",12);
@@ -131,8 +133,17 @@ public class MainActivity extends Activity {
     button("保存",()->{
       String b=base.getText().toString().trim().replaceAll("/+$","");
       try { if(!b.isEmpty()) validate(b); } catch(Exception ex) { error.setText("地址格式错误"); return; }
-      prefs.edit().putString("base",b).putString("token",token.getText().toString().trim())
-        .putString("mac",mac.getText().toString().trim()).apply(); home();
+      final String address=b,credential=token.getText().toString().trim(),networkMac=mac.getText().toString().trim();
+      final int page=pageVersion;busy=true;error.setText("正在保存连接…");
+      worker.execute(()->{
+        boolean saved=false;
+        try{synchronized(AssistantMonitor.alertGate){
+          prefs.edit().putString("base",address).putString("token",credential).putString("mac",networkMac).apply();
+          AssistantMonitor.reconnectSoon();saved=true;
+        }}catch(RuntimeException ignored){}
+        final boolean complete=saved;
+        runOnUiThread(()->{busy=false;if(!isDestroyed()&&page==pageVersion){if(complete)home();else error.setText("连接未保存，请重试");}});
+      });
     }); button("返回",this::home);
   }
   void custom() {
@@ -164,7 +175,7 @@ public class MainActivity extends Activity {
   }
   void pc(String endpoint) {
     if(get("base").isEmpty()||get("token").isEmpty()) { status.setText("请先保存电脑地址和 TOKEN。"); return; }
-    task(()->request(get("base")+"/"+endpoint+"?t="+URLEncoder.encode(get("token"),"UTF-8"),"GET","",""));
+    task(()->bridgeRequest(get("base")+"/"+endpoint+"?t="+URLEncoder.encode(get("token"),"UTF-8"),"GET","",""));
   }
   interface Work { String run() throws Exception; }
   void task(Work work) {
@@ -193,13 +204,22 @@ public class MainActivity extends Activity {
     return request(value,method,body,bearer,null);
   }
   static String request(String value,String method,String body,String bearer,Consumer<HttpURLConnection> opened)throws Exception {
+    return request(value,method,body,bearer,opened,BridgeNetworkConfig.DEFAULT);
+  }
+  BridgeNetworkConfig bridgeNetwork(){return BridgeNetworkConfig.from(prefs.getAll());}
+  String bridgeRequest(String value,String method,String body,String bearer)throws Exception {
+    return bridgeRequest(value,method,body,bearer,null);
+  }
+  String bridgeRequest(String value,String method,String body,String bearer,Consumer<HttpURLConnection> opened)throws Exception {
+    return request(value,method,body,bearer,opened,bridgeNetwork());
+  }
+  static String request(String value,String method,String body,String bearer,Consumer<HttpURLConnection> opened,BridgeNetworkConfig network)throws Exception {
     HttpURLConnection c=(HttpURLConnection)validate(value).openConnection();
     if(opened!=null)opened.accept(c);
-    c.setInstanceFollowRedirects(false); c.setConnectTimeout(4000);
+    c.setInstanceFollowRedirects(false); c.setConnectTimeout(network.connectMs);
     c.setRequestProperty("X-WristCodex-Protocol","6");
     String path=c.getURL().getPath();
-    c.setReadTimeout(path.equals("/assistant/send")||path.equals("/assistant/activate")?60000:
-      path.equals("/assistant/conversations/manage")||path.equals("/assistant/conversations/settings")?20000:8000);
+    c.setReadTimeout(network.readTimeout(path));
     c.setRequestMethod("POST".equals(method)?"POST":"GET");
     if(!bearer.isEmpty())c.setRequestProperty("Authorization","Bearer "+bearer);
     try {

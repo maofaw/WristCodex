@@ -72,5 +72,48 @@ class DecisionHttpTests(unittest.TestCase):
         self.a.store.record('settings:'+digest(['pc1','unknown']),dict(status='unknown',fingerprint='any'))
         self.assertEqual(submit('unknown')['delivery_status'],'unknown')
 
+    def test_bound_status_is_read_only_and_modern_failure_is_structured(self):
+        from urllib.parse import urlencode
+        view=self.get(6)['pending'][0]
+        scope=self.get(6)['connection_scope']
+        query=dict(t=self.token,id=view['id'],thread_id='pc1',turn_id='turn1',expected_version=view['version'],connection_scope=scope)
+        with urlopen(self.base+'/assistant/answer/status?'+urlencode(query)) as r:
+            status=json.load(r)
+        self.assertTrue(status['decision_result']['can_submit'])
+        body=json.dumps(dict(id=view['id'],thread_id='pc1',turn_id='turn1',expected_version='stale',connection_scope=scope,response={})).encode()
+        req=Request(self.base+'/assistant/answer',data=body,headers={'Authorization':'Bearer '+self.token,
+            'Content-Type':'application/json','X-WristCodex-Protocol':'6'})
+        with self.assertRaises(HTTPError) as error:urlopen(req)
+        value=json.load(error.exception)
+        self.assertIn('error',value)
+        self.assertEqual(value['decision_result']['request_status'],'stale')
+        self.assertEqual(value['decision_result']['delivery_status'],'not_sent')
+        self.assertEqual(value['connection_scope'],scope)
+        self.assertEqual(self.desktop.calls,[])
+
+    def test_duplicate_and_conflicting_answers_are_explicit_without_resending(self):
+        view=self.get(6)['pending'][0]
+        payload=dict(id=view['id'],thread_id='pc1',turn_id='turn1',expected_version=view['version'],response=dict(permissions={}))
+        def submit():
+            return urlopen(Request(self.base+'/assistant/answer',data=json.dumps(payload).encode(),headers={
+                'Authorization':'Bearer '+self.token,'Content-Type':'application/json','X-WristCodex-Protocol':'6'}))
+        with submit() as r:self.assertEqual(r.status,200)
+        with self.assertRaises(HTTPError) as error:submit()
+        self.assertEqual(json.load(error.exception)['decision_result']['submission_outcome'],'duplicate')
+        payload['response']=dict(permissions=dict(network=dict(enabled=True)))
+        with self.assertRaises(HTTPError) as error:submit()
+        self.assertEqual(json.load(error.exception)['decision_result']['submission_outcome'],'conflict')
+        self.assertEqual(len(self.desktop.calls),1)
+
+    def test_serialization_preserves_captured_scope_after_reconnect(self):
+        captured=self.a.snapshot(True,'pc1')
+        scope=captured['connection_scope']
+        self.desktop.connection_generation=99
+        self.assertNotEqual(self.a.identity_envelope()['connection_scope'],scope)
+        with patch.object(self.a,'snapshot',return_value=captured):
+            response=self.get(6)
+        self.assertEqual(response['connection_scope'],scope)
+        self.assertEqual(response['attention_generation'],scope)
+
 
 if __name__ == '__main__':unittest.main()

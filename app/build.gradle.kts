@@ -10,10 +10,10 @@ android {
     applicationId = providers.gradleProperty("qaApplicationId").getOrElse("com.n.watchremote")
     minSdk = 26
     targetSdk = 30
-    versionCode = 13
-    versionName = "0.6.1-rc3"
+    versionCode = 15
+    versionName = "0.6.3-rc1"
     testInstrumentationRunner = "com.n.watchremote.CloudVoiceInstrumentation"
-    manifestPlaceholders["appLabel"] = if (providers.gradleProperty("qaApplicationId").isPresent) "腕上遥控·语音测试" else "腕上遥控"
+    manifestPlaceholders["appLabel"] = if (providers.gradleProperty("qaApplicationId").isPresent) "腕上遥控·完成提醒测试" else "腕上遥控"
   }
   // Personal sideload app intentionally targets Android 11 for watch compatibility.
   lint { disable += "ExpiredTargetSdkVersion" }

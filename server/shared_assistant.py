@@ -8,6 +8,8 @@ from pathlib import Path
 import threading
 import time
 import copy
+import secrets
+from functools import wraps
 from urllib.parse import quote
 
 from conversations import Conversations
@@ -17,12 +19,35 @@ from ai_bridge import WORKSPACE
 from decisions import validate_form, validate_permissions, digest
 from runtime_verification import verified_actions
 from thread_management import ThreadManagement
+from completions import CompletionNotifications
 
 
 LOG = logging.getLogger(__name__)
 
 
+def scoped_response(method):
+    """Reject an assembly spanning native generations; never relabel old data."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        assistant = getattr(self, 'assistant', self)
+        captured = assistant.identity_envelope()
+        value = method(self, *args, **kwargs)
+        if assistant.identity_envelope() != captured:
+            raise ValueError('电脑连接已变化，请刷新后重新核对')
+        for part in (value, value.get('active', {}), value.get('decision_result', {})):
+            if part.get('connection_scope', captured['connection_scope']) != captured['connection_scope']:
+                raise ValueError('电脑连接已变化，请刷新后重新核对')
+            if part.get('completion_notifications', {}).get('scope', captured['connection_scope']) != captured['connection_scope']:
+                raise ValueError('电脑连接已变化，请刷新后重新核对')
+        return dict(value, **captured)
+    return wrapped
+
+
 class SharedConversations(Conversations):
+    @scoped_response
+    def list(self, cursor=None, archived=False):
+        return dict(super().list(cursor, archived), **self.assistant.identity_envelope())
+
     def describe(self, thread):
         value = super().describe(thread)
         live = self.assistant.desktop.peek(value['id'])
@@ -41,6 +66,7 @@ class SharedConversations(Conversations):
                 pass
         return super().metadata(ident)
 
+    @scoped_response
     def messages(self, ident, cursor=None):
         value = super().messages(ident, cursor)
         value['active'] = self.assistant.snapshot(True, ident)
@@ -76,6 +102,26 @@ class SharedAssistant(ThreadManagement):
         self.request_timings = OrderedDict()
         self.verified_capabilities = verified_actions(self.file.with_name('desktop-capabilities.json'))
         self.verification_generation = -1
+        self.connection_scope = secrets.token_hex(16)
+        self.scope_generation = self.desktop_generation()
+        self.completions = CompletionNotifications(self.connection_scope)
+
+    def desktop_generation(self):
+        return (getattr(self.desktop, 'connection_generation', None), self.desktop.connected)
+
+    def identity_envelope(self):
+        with self.cv:
+            generation = self.desktop_generation()
+            if generation != self.scope_generation:
+                self.connection_scope = secrets.token_hex(16)
+                self.scope_generation = generation
+                self.completions.reset(self.connection_scope)
+            return dict(connection_identity=None, connection_identity_verified=False,
+                connection_scope=self.connection_scope)
+
+    @staticmethod
+    def watch_text(prompt):
+        return native_text('【手表来源：请优先使用适合小屏阅读的简短回答。】\n' + prompt)
 
     def persist(self):
         with self.preference_lock:
@@ -136,9 +182,14 @@ class SharedAssistant(ThreadManagement):
 
     def _publish(self, force=False):
         with self.desktop.lock:
+            generation = self.desktop_generation()
             states = [s.snapshot(self.desktop.connected) for s in self.desktop.sessions.values() if s.data]
         now = time.monotonic()
         with self.cv:
+            envelope = self.identity_envelope()
+            if generation != self.desktop_generation():
+                return  # Never attach old native observations to a new scope.
+            self.completions.observe(states, generation[1])
             self.observe_timings(states, now)
             self.next_preview_at = None
             present = {s['thread_id'] for s in states}
@@ -162,7 +213,8 @@ class SharedAssistant(ThreadManagement):
                         self.next_preview_at = min(self.next_preview_at or due, due)
                 state['reply_preview'] = self.published_previews.get(ident)
             signature = json.dumps([self.desktop.connected, self.desktop.error,
-                self.desktop_attention_enabled, self.preferred, states], sort_keys=True, ensure_ascii=False)
+                self.desktop_attention_enabled, self.preferred, states, envelope['connection_scope'],
+                self.completions.snapshot(generation[1])], sort_keys=True, ensure_ascii=False)
             if force or signature != self.last_signature:
                 self.last_signature = signature
                 self.revision += 1
@@ -217,9 +269,10 @@ class SharedAssistant(ThreadManagement):
                     return
                 time.sleep(.1)
 
+    @scoped_response
     def preferences(self):
         return dict(desktop_attention_enabled=self.desktop_attention_enabled,
-            desktop_connected=self.desktop.connected, desktop_error=self.desktop.error)
+            desktop_connected=self.desktop.connected, desktop_error=self.desktop.error, **self.identity_envelope())
 
     def update_preferences(self, enabled):
         if not isinstance(enabled, bool):
@@ -228,18 +281,24 @@ class SharedAssistant(ThreadManagement):
         self.publish(True)
         return self.snapshot(True)
 
-    def attention(self, cursor=0):
+    @scoped_response
+    def attention(self, cursor=0, request_cursor=None):
         if not isinstance(cursor, int) or cursor < 0:
             raise ValueError('待处理页码无效')
         self.refresh_verification()
         rows = []
         keys = []
+        requests = []
         if self.desktop.connected:
             with self.desktop.lock:
                 for state in self.desktop.sessions.values():
                     if not state.valid:
                         continue
                     pending = state.pending()
+                    for original, _ in pending:
+                        item = self.decision_status(original)
+                        requests.append({k: item[k] for k in ('id','thread_id','turn_id','version','supported')}
+                            | dict(status=item.get('delivery_status', 'pending')))
                     keys.extend(v['id'] for v, _ in pending)
                     if pending:
                         first = self.decision_status(pending[0][0])
@@ -250,9 +309,27 @@ class SharedAssistant(ThreadManagement):
                         rows.append({k: first[k] for k in ('id', 'thread_id', 'turn_id', 'title', 'summary', 'supported','kind','version','source')}
                             | dict(count=len(pending), unavailable_reason=first.get('unavailable_reason',''), requires_protocol=6 if modern else 5))
         rows.sort(key=lambda r: (r['title'], r['thread_id']))
+        requests.sort(key=lambda r: (r['thread_id'], r['turn_id'], r['id']))
+        envelope = self.identity_envelope()
+        revision = digest([envelope['connection_scope'], requests])
+        offset = 0
+        if request_cursor is not None:
+            try:
+                bound, position = request_cursor.split(':')
+                offset = int(position)
+                if bound != revision or offset < 0 or offset > len(requests): raise ValueError()
+            except (ValueError, AttributeError):
+                raise ValueError('待处理快照已变化，请从首页重新核对') from None
         return dict(items=rows[cursor:cursor + 20], keys=keys[:128], total=sum(r['count'] for r in rows),
-            conversations=len(rows), next_cursor=cursor + 20 if cursor + 20 < len(rows) else None)
+            conversations=len(rows), next_cursor=cursor + 20 if cursor + 20 < len(rows) else None,
+            attention_available=self.desktop.connected, attention_complete=False,
+            attention_incomplete_reason='跨会话发现尚无法验证完整性；缺失条目不能视为已处理',
+            attention_generation=envelope['connection_scope'], attention_revision=revision,
+            attention_requests=requests[offset:offset+20],
+            attention_next_cursor=revision+':'+str(offset+20) if offset+20<len(requests) else None,
+            **envelope)
 
+    @scoped_response
     def snapshot(self, compact=False, thread_id=None):
         self.publish()
         ident = thread_id or self.preferred
@@ -284,8 +361,12 @@ class SharedAssistant(ThreadManagement):
         pending = self.attention()
         value.update(attention_preview=pending['items'], attention_count=pending['total'],
             attention_conversations=pending['conversations'], attention_keys=pending['keys'])
+        value.update({k: v for k, v in pending.items() if k.startswith('attention_')})
         value['capabilities'] = self.capabilities(value)
         value['pending'] = [self.decision_status(p) for p in value.get('pending', [])]
+        with self.cv:
+            self.identity_envelope()
+            value['completion_notifications'] = self.completions.snapshot(self.desktop.connected)
         return value
 
     def refresh_verification(self):
@@ -321,14 +402,50 @@ class SharedAssistant(ThreadManagement):
         feature = {'permissions': 'permissions', 'form': 'forms'}.get(value.get('kind'))
         if feature and feature not in self.verified_capabilities:
             value.update(supported=False, unavailable_reason='本机此类确认接口尚未通过验证，请在电脑处理')
-        key = 'decision:' + digest([value.get('id'), value.get('version')])
-        old = self.store.receipt(key)
+        old = self.decision_receipt(value.get('id'), value.get('thread_id'), value.get('turn_id'), value.get('version'))
         if old and old.get('status') in ('sending', 'unknown', 'accepted'):
             value.update(supported=False, unavailable_reason='此回答已提交或送达未知，请刷新确认，不会重复发送',
                 delivery_status=old['status'])
         value['availability_version'] = digest([value.get('supported'),
             [(o.get('value'),o.get('supported',True)) for o in value.get('decisions',[])]])
         return value
+
+    def decision_receipt(self, token, thread_id, turn_id, version=None):
+        key = 'decision-request:' + digest([thread_id, turn_id, token])
+        return (self.store.receipt(key) or self.store.receipt('decision:' + digest([token, version]))
+            or self.store.decision_guard(token, thread_id, turn_id))
+
+    @staticmethod
+    def requires_decision_version(view, decision=None):
+        return (view['kind'] not in ('questions','approval','manual')
+            or view.get('source') == 'async_questions'
+            or isinstance(decision,str) and (decision.startswith('option:') or decision=='acceptForSession'))
+
+    @scoped_response
+    def answer_status(self, token, thread_id, turn_id, expected_version=None, connection_scope=None):
+        for value in (token, thread_id, turn_id): self.ident(value)
+        envelope = self.identity_envelope()
+        old = self.decision_receipt(token, thread_id, turn_id, expected_version)
+        delivery = old.get('status', 'not_sent')
+        result = dict(id=token, thread_id=thread_id, turn_id=turn_id, version=expected_version,
+            request_status='unverified', delivery_status=delivery, can_submit=False,
+            atomic_native_binding=False, **envelope)
+        if connection_scope is not None and connection_scope != envelope['connection_scope']:
+            return dict(result, request_status='stale')
+        with self.desktop.lock:
+            session = self.desktop.sessions.get(thread_id)
+            if not self.desktop.connected or session is None or not session.valid: return result
+            pending = next((view for view, _ in session.pending() if view['id'] == token), None)
+            if pending is None:
+                # Only a valid native owner projection can establish removal of
+                # a request we actually submitted; catalog absence never does.
+                return dict(result, request_status='processed' if old else 'unverified')
+            view = self.decision_status(pending)
+            stale = turn_id != view['turn_id'] or expected_version is not None and expected_version != view['version']
+            missing_version = self.requires_decision_version(view) and not expected_version
+            return dict(result, version=view['version'], request_status='stale' if stale else 'pending',
+                can_submit=not stale and not missing_version and view['supported'] and delivery in ('not_sent','rejected'),
+                unavailable_reason='请使用当前操作版本重新核对后提交' if missing_version else '')
 
     @staticmethod
     def client_snapshot(value, protocol=5):
@@ -481,7 +598,7 @@ class SharedAssistant(ThreadManagement):
                     previous_started_at = session.latest_turn().get('turnStartedAtMs') or 0
                 sent = True
                 result = self.desktop.request('thread-follower-start-turn', dict(conversationId=ident,
-                    turnStart=dict(request=dict(threadId=ident, input=[native_text(prompt)],
+                    turnStart=dict(request=dict(threadId=ident, input=[self.watch_text(prompt)],
                         clientUserMessageId=request_id), context=dict(inheritThreadSettings=True))), owner, timeout=20)
                 self.timing(request_id, 'native_received', time.monotonic())
                 turn = result.get('result', {}).get('result', {}).get('turn', {})
@@ -549,7 +666,7 @@ class SharedAssistant(ThreadManagement):
             self.store.record(request_id, receipt)
             try:
                 self.desktop.request('thread-follower-steer-turn', dict(conversationId=thread_id,
-                    input=[native_text(prompt)], restoreMessage=restore, clientUserMessageId=request_id), owner, timeout=15)
+                    input=[self.watch_text(prompt)], restoreMessage=restore, clientUserMessageId=request_id), owner, timeout=15)
                 receipt['status'] = 'accepted'
             except Exception as exc:
                 receipt['status'] = 'rejected' if isinstance(exc, DesktopUnavailable) else 'unknown'
@@ -558,15 +675,22 @@ class SharedAssistant(ThreadManagement):
                 self.store.record(request_id, receipt)
             return dict(self.snapshot(True, thread_id), supplement_accepted=True)
 
-    def answer(self, token, decision=None, answers=None, thread_id=None, turn_id=None, expected_version=None, response=None):
+    def answer(self, token, decision=None, answers=None, thread_id=None, turn_id=None, expected_version=None, response=None, connection_scope=None):
         with self.operation_lock:
+            if connection_scope is not None and connection_scope != self.identity_envelope()['connection_scope']:
+                raise ValueError('连接作用域已变化，操作未发送')
+            old = self.decision_receipt(token, thread_id, turn_id, expected_version)
+            if old.get('status') in ('sending','unknown'):
+                raise DeliveryUnknown('回答送达未知，请先在电脑核对，不会重复发送')
+            if old.get('status') == 'accepted':
+                raise RuntimeError('此回答已经提交，请刷新')
             owner, _, (view, raw) = self.target(thread_id, turn_id, token)
-            new_kind = view['kind'] not in ('questions', 'approval', 'manual') or view.get('source') == 'async_questions' or isinstance(decision,str) and (decision.startswith('option:') or decision=='acceptForSession')
+            new_kind = self.requires_decision_version(view, decision)
             if ((expected_version is not None and expected_version != view.get('version'))
                     or new_kind and not expected_version):
                 raise ValueError('请求内容已变化或缺少操作版本，请刷新后决定')
-            receipt_key = 'decision:' + digest([token, view.get('version')])
-            old = self.store.receipt(receipt_key)
+            receipt_key = 'decision-request:' + digest([thread_id, turn_id, token])
+            old = self.decision_receipt(token, thread_id, turn_id, view.get('version'))
             if old:
                 if old.get('status') in ('sending', 'unknown'):
                     raise DeliveryUnknown('回答送达未知，请先在电脑核对，不会重复发送')
@@ -614,7 +738,16 @@ class SharedAssistant(ThreadManagement):
                 method = 'thread-follower-submit-user-input'
             else:
                 raise DesktopUnavailable('此类型没有已验证的提交接口，请在电脑处理')
-            receipt = dict(thread_id=thread_id, turn_id=turn_id, status='sending', fingerprint=digest(params))
+            # Recheck the exact local owner/request immediately before dispatch.
+            # Native answer RPC has no verified expected-turn/version field;
+            # this reduces the race window but is not an atomic native guarantee.
+            current_owner, _, (current, _) = self.target(thread_id, turn_id, token)
+            if current_owner != owner or current.get('version') != view.get('version'):
+                raise ValueError('请求所属电脑或内容已变化，操作未发送')
+            receipt = dict(thread_id=thread_id, turn_id=turn_id, decision_id=token,
+                connection_scope=self.identity_envelope()['connection_scope'], version=view.get('version'),
+                created_at=time.time(), updated_at=time.time(), status='sending', fingerprint=digest(params),
+                answer_fingerprint=digest([decision, answers, response]))
             self.store.record(receipt_key, receipt)
             try:
                 self.desktop.request(method, params, owner)
@@ -623,8 +756,10 @@ class SharedAssistant(ThreadManagement):
                 receipt['status'] = 'rejected' if isinstance(exc, DesktopUnavailable) else 'unknown'
                 raise
             finally:
+                receipt['updated_at'] = time.time()
                 self.store.record(receipt_key, receipt)
-        return self.snapshot(True, thread_id)
+        return dict(self.snapshot(True, thread_id),
+            decision_result=self.answer_status(token, thread_id, turn_id, expected_version, connection_scope))
 
     def stop(self, thread_id=None, turn_id=None):
         with self.operation_lock:

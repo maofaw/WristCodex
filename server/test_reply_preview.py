@@ -475,7 +475,7 @@ class StreamingTests(unittest.TestCase):
         params = self.desktop.calls[0][1]
         self.assertEqual(params['turnStart']['context'], dict(inheritThreadSettings=True))
         native = params['turnStart']['request']['input'][0]
-        self.assertEqual(native, dict(type='text', text='接着聊', text_elements=[]))
+        self.assertEqual(native, dict(type='text', text='【手表来源：请优先使用适合小屏阅读的简短回答。】\n接着聊', text_elements=[]))
         # Desktop renderer calls e.text_elements.some(...), so missing is a crash.
         self.assertIsInstance(native['text_elements'], list)
 

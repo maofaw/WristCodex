@@ -3,6 +3,17 @@ package com.n.watchremote;
 /** Bounded, framework-free decisions shared by the native UI and host-JVM tests. */
 final class UiState {
   private UiState(){}
+  static int panelLimit(int cap,int available,boolean bounded){return bounded?Math.min(cap,available):cap;}
+  static boolean chatShortcuts(boolean list,boolean attention){return !list&&!attention;}
+  static String rowSource(boolean cached,boolean readonly,String source){return cached?"离线记录":readonly?"只读 · 可尝试连接":source.equals("shared")?"电脑 · 可续聊":"手表";}
+  static final class DecisionView {
+    boolean busy;long owner;String request="",clickedId="",clickedVersion="";
+    void bind(String id,String version){clickedId=id;clickedVersion=version;}
+    boolean matches(String id,String version){return clickedId.isEmpty()||(clickedId.equals(id)&&clickedVersion.equals(version));}
+    long begin(String request){this.request=request;busy=true;return ++owner;}
+    boolean finish(long ticket){if(ticket!=owner)return false;busy=false;return true;}
+    void cancel(boolean leaveNotification){owner++;busy=false;request="";if(leaveNotification){clickedId="";clickedVersion="";}}
+  }
   static int effortIndex(String current,String[] values){
     for(int i=0;i<values.length;i++)if(values[i].equals(current))return i+1;
     return 0;
@@ -16,6 +27,8 @@ final class UiState {
     final java.util.ArrayList<String> cursors=new java.util.ArrayList<>();
     int page,target;boolean loading,next,reset;
     Pager(){cursors.add("");}
+    static Pager cached(String cursor,String next){Pager pager=new Pager();pager.cursors.set(0,cursor);pager.loading=true;pager.success(next);return pager;}
+    Pager copy(){Pager out=new Pager();out.cursors.clear();out.cursors.addAll(cursors);out.page=page;out.target=page;out.next=next;return out;}
     boolean canPrevious(){return !loading&&page>0;}
     boolean canNext(){return !loading&&next;}
     String first(){if(loading)return null;loading=true;target=0;reset=true;return "";}
@@ -35,6 +48,15 @@ final class UiState {
       loading=false;reset=false;
     }
     void failed(){loading=false;reset=false;}
+    void refresh(String following){if(!loading){loading=true;target=page;reset=false;}success(following);}
+  }
+  static boolean canRememberAnchor(String viewed,String rowOwner,boolean listMode){return !listMode&&!viewed.isEmpty()&&viewed.equals(rowOwner);}
+  static final class AttentionPage {
+    final String current,next;final int total;
+    AttentionPage(String current,String next,int total){this.current=current;this.next=next.equals("null")?"":next;this.total=total;}
+    AttentionPage copy(){return new AttentionPage(current,next,total);}
+    boolean hasNext(){return !next.isEmpty();}
+    String countLabel(){return total+" 项等待处理";}
   }
   static String answerText(String value){
     return value.trim().isEmpty()?null:value;
@@ -43,9 +65,7 @@ final class UiState {
     return !shared||blank||(running?canSteer:canSend);
   }
   static long retryDelay(int failures){
-    if(failures<=1)return 1000;
-    if(failures>=5)return 15000;
-    return 1000L<<(failures-1);
+    return BridgeNetworkConfig.DEFAULT.retryDelay(failures);
   }
   static final class History {
     boolean olderWindow,deferred;
