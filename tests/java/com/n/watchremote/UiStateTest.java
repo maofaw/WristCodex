@@ -4,6 +4,14 @@ package com.n.watchremote;
 public final class UiStateTest {
   static void check(boolean value,String message){if(!value)throw new AssertionError(message);}
   public static void main(String[] args){
+    UiState.DecisionView decision=new UiState.DecisionView();decision.bind("A","v1");long old=decision.begin("A:v1");
+    decision.cancel(true);check(!decision.busy&&decision.matches("B","v2"),"Back releases notification binding and busy verification");
+    long newer=decision.begin("B:v2");check(!decision.finish(old)&&decision.busy,"cancelled response cannot clear newer verification");
+    check(decision.finish(newer)&&!decision.busy,"current response owns busy state");
+    decision.bind("A","v1");decision.begin("A:v1");decision.cancel(false);check(!decision.busy&&!decision.matches("B","v2"),"pause cancels verification while temporary request remains bound");
+    check(UiState.panelLimit(248,80,true)==80&&UiState.panelLimit(248,0,false)==248,"bounded scroll respects dialog remaining space");
+    check(!UiState.chatShortcuts(true,false)&&!UiState.chatShortcuts(false,true)&&UiState.chatShortcuts(false,false),"shortcuts belong only to chat");
+    check("离线记录".equals(UiState.rowSource(true,false,"")),"cached unknown source must not be called watch");
     check(UiState.effortIndex(null,new String[]{"low","high"})==0,"unspecified desktop effort remains unchanged");
     check(UiState.effortIndex("high",new String[]{"low","high"})==2,"explicit desktop effort maps after inherited entry");
     check(UiState.effortValue(0,new String[]{"low","high"})==null,"inherited option must not write a default effort");

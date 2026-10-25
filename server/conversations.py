@@ -9,10 +9,22 @@ import time
 
 
 class ConversationStore:
+    TERMINAL_RECEIPT_LIMIT = 1024
+    TERMINAL_RECEIPT_DAYS = 30
     def __init__(self, state_file):
         self.root=state_file.parent/(state_file.stem+'-conversations')
         self.lock=threading.RLock()
         self.index=self._read(self.root/'index.json',{})
+        self.receipts = {}
+        self.legacy_guards = {}
+        self.corrupt_receipts = set()
+        # One directory read per store construction, never per pending request.
+        for path in (self.root/'receipts').glob('*.json'):
+            value = self._read(path, None)
+            self.receipts[path.stem] = value
+            self._index_guard(path.stem, value, 1)
+        self._prune_terminal()
+
 
     @staticmethod
     def _read(path, default):
@@ -47,11 +59,93 @@ class ConversationStore:
     def state(self,ident):
         with self.lock:return self._read(self._path('states',ident),{})
 
+    @staticmethod
+    def _valid_decision(value):
+        return (isinstance(value, dict) and value.get('status') in
+            ('sending', 'unknown', 'accepted', 'rejected') and
+            all(isinstance(value.get(k), str) and value[k] for k in ('thread_id', 'turn_id')))
+
+    @staticmethod
+    def _legacy_message(value):
+        # Older message dedup receipts used two fields, with some deployments
+        # also persisting status=accepted before turn IDs were recorded.
+        # This exemption applies to directory indexing only: an exact decision
+        # key still requires the decision schema in receipt().
+        return (isinstance(value, dict) and (set(value) == {'fingerprint','thread_id'}
+                or set(value) == {'fingerprint','thread_id','status'} and value['status'] == 'accepted')
+            and isinstance(value['thread_id'],str) and len(value['thread_id']) <= 200
+            and isinstance(value['fingerprint'],str) and len(value['fingerprint']) == 64
+            and all(c in '0123456789abcdef' for c in value['fingerprint']))
+
+    def _index_guard(self, key, value, delta):
+        if self._legacy_message(value): return
+        if not isinstance(value, dict) or value.get('receipt_kind') != 'other' and not self._valid_decision(value):
+            if delta > 0: self.corrupt_receipts.add(key)
+            else: self.corrupt_receipts.discard(key)
+            return
+        if value.get('receipt_kind') == 'other' or value.get('decision_id'): return
+        status = value.get('status')
+        if status not in ('unknown','sending','accepted'): return
+        bucket = (value['thread_id'], value['turn_id'], status)
+        count = self.legacy_guards.get(bucket, 0) + delta
+        if count: self.legacy_guards[bucket] = count
+        else: self.legacy_guards.pop(bucket, None)
+
     def receipt(self,ident):
-        with self.lock:return self._read(self._path('receipts',ident),{})
+        with self.lock:
+            key = self._path('receipts',ident).stem
+            if key not in self.receipts: return {}
+            value = self.receipts[key]
+            if ident.startswith(('decision:', 'decision-request:')) and not self._valid_decision(value):
+                return dict(status='unknown', receipt_corrupt=True)
+            return dict(value) if isinstance(value,dict) else {}
 
     def record(self,ident,value):
-        with self.lock:self._write(self._path('receipts',ident),value)
+        with self.lock:
+            value = dict(value, receipt_kind='decision' if ident.startswith(('decision:', 'decision-request:')) else 'other')
+            value.setdefault('updated_at', time.time())
+            path = self._path('receipts',ident)
+            self._write(path,value)
+            if path.stem in self.receipts: self._index_guard(path.stem, self.receipts[path.stem], -1)
+            self.receipts[path.stem] = value
+            self._index_guard(path.stem,value,1)
+            # Cleanup at most once per minute, outside request lookups.
+            if time.monotonic() >= getattr(self, 'next_receipt_cleanup', 0): self._prune_terminal()
+
+    def _prune_terminal(self):
+        """30-day/1024-record limit for proven terminal records only.
+
+        Ambiguous legacy records, corrupt records, sending, unknown and accepted
+        without native removal evidence are retained without eviction.
+        """
+        terminal = []
+        for key, value in self.receipts.items():
+            if key in self.corrupt_receipts: continue
+            if not isinstance(value,dict) or value.get('receipt_kind') not in ('decision','other'): continue
+            if value.get('receipt_kind') == 'decision' and not self._valid_decision(value): continue
+            if value.get('status') != 'rejected' and not (
+                    value.get('status') == 'accepted'
+                    and isinstance(value.get('processed_at'),(int,float))
+                    and not isinstance(value['processed_at'],bool)
+                    and math.isfinite(value['processed_at']) and value['processed_at'] > 0): continue
+            stamp = value.get('updated_at')
+            if isinstance(stamp, (float,int)) and not isinstance(stamp,bool) and math.isfinite(stamp): terminal.append((stamp,key))
+        terminal.sort()
+        cutoff = time.time()-self.TERMINAL_RECEIPT_DAYS*86400
+        for i,(stamp,key) in enumerate(terminal):
+            if stamp >= cutoff and i >= len(terminal)-self.TERMINAL_RECEIPT_LIMIT: continue
+            try: (self.root/'receipts'/(key+'.json')).unlink()
+            except OSError: continue
+            self._index_guard(key,self.receipts.pop(key),-1)
+        self.next_receipt_cleanup = time.monotonic()+60
+
+    def decision_guard(self, token, thread_id, turn_id):
+        with self.lock:
+            if self.corrupt_receipts: return dict(status='unknown',receipt_corrupt=True)
+            for status in ('unknown','sending','accepted'):
+                if self.legacy_guards.get((thread_id,turn_id,status)):
+                    return dict(status=status,thread_id=thread_id,turn_id=turn_id)
+            return {}
 
 
 class Conversations:

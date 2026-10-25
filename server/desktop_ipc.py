@@ -483,6 +483,8 @@ class Projection:
         if not connected or not self.valid:
             message = '电脑客户端未连接，草稿已保留'
         return dict(thread_id=self.data.get('id', ''), title=self.data.get('title') or '电脑对话',
+            model=((self.data.get('latestCollaborationMode') or {}).get('settings') or {}).get('model')
+                or self.data.get('latestModel') or (self.data.get('latestThreadSettings') or {}).get('model'),
             turn_id=turn.get('turnId') or (pending[0]['turn_id'] if pending else ''),
             request_id=turn.get('request_id') or '', state=state, message=message,
             summary=self.reply[:180] if state in ('completed', 'failed', 'interrupted') else '',

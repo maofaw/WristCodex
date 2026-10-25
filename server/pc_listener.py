@@ -13,9 +13,11 @@ import threading
 import json
 import os
 import hmac
+import secrets
 import ai_bridge
 from codex_session import assistant as legacy_assistant
 from shared_assistant import SharedAssistant
+from decisions import digest
 import voice
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +43,7 @@ if len(TOKEN) < 16 or TOKEN == "replace-with-your-random-token":
 PORT = int(os.environ.get("WATCHREMOTE_PORT", str(urlparse(env.get("PC_BASE", "")).port or 8877)))
 BIND = os.environ.get("WATCHREMOTE_BIND", env.get("BIND", "127.0.0.1"))
 assistant = configured_assistant()
+LEGACY_CONNECTION_SCOPE = secrets.token_hex(16)
 
 def session_locked():
   # LogonUI.exe runs while lock screen shown; false positives only during
@@ -57,6 +60,18 @@ class Handler(BaseHTTPRequestHandler):
     return int(value)
 
   def reply_json(self, code, value):
+    if isinstance(value,dict):
+      captured = next((part for part in (value,value.get('active',{}),value.get('decision_result',{}))
+        if isinstance(part,dict) and part.get('connection_scope')), None)
+      envelope=({k:captured[k] for k in ('connection_identity','connection_identity_verified','connection_scope')} if captured else
+        assistant.identity_envelope() if isinstance(assistant,SharedAssistant) else
+        dict(connection_identity=None,connection_identity_verified=False,connection_scope=LEGACY_CONNECTION_SCOPE))
+      value=dict(value,**envelope)
+      for key in ('active','decision_result'):
+        if isinstance(value.get(key),dict):
+          if value[key].get('connection_scope',envelope['connection_scope']) != envelope['connection_scope']:
+            raise ValueError('电脑连接已变化，请刷新后重新核对')
+          value[key]=dict(value[key],**envelope)
     if isinstance(assistant,SharedAssistant) and isinstance(value,dict):
       value=assistant.client_snapshot(value,self.client_protocol())
       if isinstance(value.get('active'),dict):
@@ -109,7 +124,18 @@ class Handler(BaseHTTPRequestHandler):
     elif url.path == '/assistant/preferences':
       self.reply_json(200,assistant.preferences())
     elif url.path == '/assistant/attention':
-      try:self.reply_json(200,assistant.attention(int(parse_qs(url.query).get('cursor',['0'])[0])))
+      try:
+        query=parse_qs(url.query)
+        self.reply_json(200,assistant.attention(int(query.get('cursor',['0'])[0]),query.get('request_cursor',[None])[0])
+          if isinstance(assistant,SharedAssistant) else assistant.attention(int(query.get('cursor',['0'])[0])))
+      except ValueError as exc:self.reply(400,str(exc))
+    elif url.path == '/assistant/answer/status':
+      try:
+        if not isinstance(assistant,SharedAssistant):raise ValueError('此功能需要电脑共享模式')
+        query=parse_qs(url.query)
+        self.reply_json(200,dict(decision_result=assistant.answer_status(
+          query.get('id',[''])[0],query.get('thread_id',[''])[0],query.get('turn_id',[''])[0],
+          query.get('expected_version',[None])[0],query.get('connection_scope',[None])[0])))
       except ValueError as exc:self.reply(400,str(exc))
     elif url.path in ('/assistant/conversations/settings','/assistant/conversations/manage'):
       try:
@@ -169,7 +195,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.client_protocol()<6 and str(payload.get('decision','')).startswith('option:'):
           raise ValueError('此授权规则需要新版手表完整显示，请在电脑处理')
         if isinstance(assistant,SharedAssistant):
-          value=assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers'),payload.get('thread_id'),payload.get('turn_id'),payload.get('expected_version'),payload.get('response'))
+          value=assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers'),payload.get('thread_id'),payload.get('turn_id'),payload.get('expected_version'),payload.get('response'),payload.get('connection_scope'))
         else:value=assistant.answer(payload.get('id'),payload.get('decision'),payload.get('answers'),payload.get('thread_id'),payload.get('turn_id'))
         self.reply_json(200,value)
       elif url.path == '/assistant/conversations/open':
@@ -197,6 +223,18 @@ class Handler(BaseHTTPRequestHandler):
       self.post_error(url.path, payload, 409, exc)
 
   def post_error(self, path, payload, code, exc):
+    if isinstance(assistant, SharedAssistant) and isinstance(payload,dict) and path=='/assistant/answer' and self.headers.get('X-WristCodex-Protocol')=='6':
+      try:
+        result=assistant.answer_status(payload.get('id'),payload.get('thread_id'),payload.get('turn_id'),payload.get('expected_version'),payload.get('connection_scope'))
+        old=assistant.decision_receipt(payload.get('id'),payload.get('thread_id'),payload.get('turn_id'),payload.get('expected_version'))
+        if old.get('status') in ('sending','unknown','accepted'):
+          fingerprint=old.get('answer_fingerprint')
+          result['submission_outcome']=('duplicate' if fingerprint==digest([payload.get('decision'),payload.get('answers'),payload.get('response')])
+            else 'conflict') if fingerprint else 'blocked_prior_submission'
+      except ValueError:
+        result=dict(request_status='unverified',delivery_status='not_sent',can_submit=False)
+      self.reply_json(code,dict(error=str(exc),decision_result=result))
+      return
     if isinstance(assistant, SharedAssistant) and isinstance(payload, dict) and path in ('/assistant/conversations/settings','/assistant/conversations/manage'):
       kind='settings' if path.endswith('/settings') else 'manage'
       self.reply_json(code,dict(error=str(exc),delivery_status=assistant.operation_delivery(kind,payload.get('thread_id'),payload.get('operation_id'))))
